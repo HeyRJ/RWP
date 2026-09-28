@@ -1,0 +1,9 @@
+# Services RWP checks (read-only). Copy to config/services.tsv. TAB-separated; no empty fields (use -).
+# required: yes = down blocks ACTIVE | watch = down is a warning | info = listed only
+# type: port (listening TCP port, your user) | proc (pgrep -f pattern) | launchd-running | launchd-periodic
+# restart hint = a command for YOU to run on the home Mac (from away: ssh <user>@<home-mac> '<hint>'). RWP never runs it.
+# id	project	required	type	target	restart-hint	note
+# ntfy	notifications	yes	port	8080	launchctl kickstart -k gui/501/<label>	phone pushes
+# api-server	my-app	watch	launchd-running	<launchd.label>	launchctl kickstart -k gui/501/<launchd.label>	the thing you demo
+# nightly-job	my-app	watch	launchd-periodic	<launchd.label>	-	runs every night
+# model-server	my-lab	info	port	8000	-	started by hand; will not survive a restart

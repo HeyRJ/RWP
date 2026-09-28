@@ -1,0 +1,41 @@
+# RWP settings. Copy to config/rwp.conf and fill in (INIT.md does this with you).
+# Sourced by bin/rwp (bash). No secrets here, ever.
+
+# The Mac that stays home
+SERVER_LABEL="the home Mac"                     # how messages refer to it ("the mini", "the studio"...)
+SERVER_LOCALHOSTNAME="<LocalHostName>"          # `scutil --get LocalHostName` on it; used to tell which machine the script is on
+SERVER_TS_NAME="<tailscale-name>"               # its Tailscale MagicDNS short name
+SERVER_TS_FQDN="<tailscale-name>.<tailnet>.ts.net"
+SERVER_TS_IP="<100.x.y.z>"
+SERVER_USER="<macos-username>"
+SERVER_LAN_IP="<192.168.x.y>"                   # after you reserve it on the router (SETUP 2)
+
+# What you carry
+LAPTOP_LABEL="the laptop"
+CARRY_NODES="<laptop-tailscale-name> <phone-tailscale-name>"   # key expiry is checked against your return date
+CONTROL_CHAT="Home Mac control"                 # the pinned Claude conversation linked to the home Mac
+RWP_REMOTE_DIR="Projects/RWP"                   # where this repo lives under ~ (same on both Macs)
+
+# Thresholds
+PROJECTS_DIR="$HOME/Projects"                   # repos scanned for unpushed/uncommitted work (two levels deep)
+MIN_FREE_GB=50                                  # SSD free-space floor while away
+REQUIRED_VOLUMES=""                             # external volumes that must stay mounted, e.g. "Archive Data"
+STALE_DAYS=14                                   # tailnet node offline this long = stale
+ACTIVE_DAYS=14                                  # repo with a commit in this window = in use
+JOB_MIN_SECS=1800                               # processes older than this are listed as "left running"
+HANDOFF_MAX_HOURS=24                            # a laptop handoff receipt older than this doesn't count
+
+# Pushes to your phone (optional): an ntfy server reachable from the phone over Tailscale
+NTFY_URL=""                                     # e.g. "http://127.0.0.1:8080" if ntfy runs on the home Mac
+NTFY_TOPIC="rwp"
+
+# Outside heartbeat (SETUP 4). The ping URL lives in state/heartbeat.url, never in git.
+HEARTBEAT_LABEL="local.rwp.heartbeat"
+HEARTBEAT_EVERY=300
+
+# Commit STATE + the trip log and push to your PRIVATE remote on depart/return (DECISIONS D13)
+AUTO_PUSH=0
+
+# FileVault pre-boot way in (SETUP Later)
+LAN_FOOTHOLD=""                                 # e.g. "raspberry pi subnet router"
+PREBOOT_TESTED=""                               # date you last unlocked FileVault over SSH at the pre-boot screen

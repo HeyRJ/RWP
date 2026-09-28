@@ -1,0 +1,754 @@
+#!/bin/bash
+# rwp — Remote Working Protocol (read PROTOCOL.md first)
+#   rwp preflight [--back YYYY-MM-DD]      read-only checks of the home Mac (from the laptop: runs over SSH)
+#   rwp depart --leave "WHEN" --back YYYY-MM-DD [--devices "laptop phone"]
+#              [--accept "ID: reason"]... [--activate]
+#                                          without --activate: preflight + draft away sheet
+#                                          with --activate: ACTIVE / NOT ACTIVE, STATE -> AWAY, push to phone
+#   rwp handoff                            on the laptop, OFF home Wi-Fi: prove the path in, leave a receipt
+#   rwp status                             mode + anything failing (laptop: over SSH, result cached)
+#   rwp notify "message"                   push to the phone (ntfy, if configured)
+#   rwp return                             back home: re-check, checklist, STATE -> HOME
+#   rwp heartbeat install URL [--dry-run] | test | remove    outside dead-man's switch (SETUP S8)
+# Checks are read-only. The only commands that change the system are 'heartbeat install/remove',
+# and you run those yourself. Writes inside this repo: state/, LOG/, STATE.md. bash 3.2 (macOS stock).
+
+set -u
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+RWP_HOME="$(cd "$(dirname "$0")/.." && pwd -P)"
+if [ ! -f "$RWP_HOME/config/rwp.conf" ]; then
+  echo "rwp: config/rwp.conf not found. Copy config/rwp.conf.example to config/rwp.conf and fill it in (INIT.md walks you through it)." >&2
+  exit 2
+fi
+if grep -qE '^[A-Z_]+="[^"]*<[^>]+>' "$RWP_HOME/config/rwp.conf"; then
+  echo "rwp: config/rwp.conf still has <placeholders>. Fill them in first (INIT.md walks you through it)." >&2
+  exit 2
+fi
+# shellcheck source=/dev/null
+. "$RWP_HOME/config/rwp.conf"
+: "${SERVER_LABEL:=the home Mac}" "${LAPTOP_LABEL:=the laptop}" "${CONTROL_CHAT:=Home Mac control}"
+: "${RWP_REMOTE_DIR:=Projects/RWP}" "${AUTO_PUSH:=0}" "${HEARTBEAT_LABEL:=local.rwp.heartbeat}" "${HEARTBEAT_EVERY:=300}"
+: "${CARRY_NODES:=}" "${REQUIRED_VOLUMES:=}" "${SERVER_LAN_IP:=}" "${NTFY_URL:=}" "${NTFY_TOPIC:=rwp}"
+: "${LAN_FOOTHOLD:=}" "${PREBOOT_TESTED:=}" "${PROJECTS_DIR:=$HOME/Projects}"
+: "${MIN_FREE_GB:=50}" "${STALE_DAYS:=14}" "${ACTIVE_DAYS:=14}" "${JOB_MIN_SECS:=1800}" "${HANDOFF_MAX_HOURS:=24}"
+STATE_DIR="$RWP_HOME/state"
+mkdir -p "$STATE_DIR" "$RWP_HOME/LOG"
+NOW="$(date '+%Y-%m-%d %H:%M %Z')"
+STAMP="$(date '+%Y%m%d-%H%M%S')"
+UID_N="$(id -u)"
+TAB="$(printf '\t')"
+NL='
+'
+
+TS_BIN="/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+[ -x "$TS_BIN" ] || TS_BIN="$(command -v tailscale 2>/dev/null || true)"
+PY=""
+for p in /opt/homebrew/bin/python3 /usr/local/bin/python3; do [ -x "$p" ] && { PY="$p"; break; }; done
+if [ -z "$PY" ] && xcode-select -p >/dev/null 2>&1; then PY=/usr/bin/python3; fi
+
+SERVER_SSH="$SERVER_USER@$SERVER_TS_NAME"
+SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15"
+HB_PLIST="$HOME/Library/LaunchAgents/$HEARTBEAT_LABEL.plist"
+role() {
+  if [ -n "${RWP_ROLE:-}" ]; then echo "$RWP_ROLE"; return; fi   # test override only
+  if [ "$(scutil --get LocalHostName 2>/dev/null)" = "$SERVER_LOCALHOSTNAME" ]; then echo server; else echo client; fi
+}
+on_server_or_ssh() {  # re-run this command on the home Mac when called from the laptop
+  if [ "$(role)" != server ]; then
+    echo "rwp: this Mac isn't $SERVER_LOCALHOSTNAME, so running '$1' there over SSH ($SERVER_SSH)." >&2
+    # shellcheck disable=SC2029,SC2086,SC2088
+    exec ssh $SSH_OPTS "$SERVER_SSH" "~/$RWP_REMOTE_DIR/bin/rwp $(printf '%q ' "$@")"
+  fi
+}
+
+# ---- bookkeeping ----------------------------------------------------------
+NPASS=0; NWARN=0; NFAIL=0; FAILS=""; ACCEPTED=""
+ACCEPT_IDS=""; ACCEPT_TEXT=""
+QUIET=0; OUT=/dev/null; MODE_ACTIVATE=0
+BACK_DATE=""; LEAVE=""; DEVICES=""; FV=unknown; CUR_LAN_IP=""
+
+say()    { printf '%s\n' "$*" >> "$OUT"
+           if [ "$QUIET" = 0 ]; then printf '%s\n' "$*"
+           else case "$*" in "[FAIL]"*|"[WARN]"*|"[ACPT]"*|"       fix:"*) printf '%s\n' "$*";; esac; fi; }
+loud()   { printf '%s\n' "$*" >> "$OUT"; printf '%s\n' "$*"; }
+fixln()  { if [ -n "${1:-}" ] && [ "${1:-}" != "-" ]; then say "       fix: $1"; fi; }
+pass()   { NPASS=$((NPASS+1)); say "[PASS] $1  $2"; }
+info()   { say "[INFO] $1  $2"; }
+warn()   { NWARN=$((NWARN+1)); say "[WARN] $1  $2"; fixln "${3:-}"; }
+accept_reason() { printf '%s' "$ACCEPT_TEXT" | awk -F"$TAB" -v id="$1" '$1==id{print $2; exit}'; }
+fail()   { case " $ACCEPT_IDS " in
+             *" $1 "*) ACCEPTED="$ACCEPTED$1 "; say "[ACPT] $1  $2  (accepted: $(accept_reason "$1"))"; return 0;;
+           esac
+           NFAIL=$((NFAIL+1)); FAILS="$FAILS$1 "; say "[FAIL] $1  $2"; fixln "${3:-}"; }
+emit()   { case "$1" in PASS) pass "$2" "$3";; WARN) warn "$2" "$3" "${4:-}";; FAIL) fail "$2" "$3" "${4:-}";; *) info "$2" "$3";; esac; }
+hardfail() { if [ "$MODE_ACTIVATE" = 1 ]; then fail "$@"; else warn "$@"; fi; }   # hard only at activation
+
+parse_args() {
+  local id why
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --back)     BACK_DATE="${2:-}"; shift 2;;
+      --leave)    LEAVE="${2:-}"; shift 2;;
+      --devices)  DEVICES="${2:-}"; shift 2;;
+      --activate) MODE_ACTIVATE=1; shift;;
+      --accept)   id="$(printf '%s' "${2%%:*}" | tr -d ' ')"; why="$(printf '%s' "${2#*:}" | sed 's/^ *//')"
+                  ACCEPT_IDS="$ACCEPT_IDS $id"; ACCEPT_TEXT="$ACCEPT_TEXT$id$TAB$why$NL"; shift 2;;
+      --quiet)    QUIET=1; shift;;
+      *) echo "rwp: unknown option '$1' (rwp help)" >&2; exit 2;;
+    esac
+  done
+  if [ -n "$BACK_DATE" ] && ! date -j -f %Y-%m-%d "$BACK_DATE" +%s >/dev/null 2>&1; then
+    echo "rwp: --back must be YYYY-MM-DD" >&2; exit 2
+  fi
+}
+
+# ---- checks on the home Mac (all read-only) ----------------------------------
+chk_tailscale() {
+  local js="$STATE_DIR/.ts.json" res="$STATE_DIR/.ts.res"
+  if [ -z "$TS_BIN" ]; then fail H1 "Tailscale CLI not found" "install Tailscale"; return; fi
+  if ! "$TS_BIN" status --json > "$js" 2>/dev/null; then
+    fail H1 "tailscale status failed (not running, or logged out)" "open -a Tailscale"; return
+  fi
+  if [ -z "$PY" ]; then warn H1 "no python3 to read tailscale status" "brew install python"; return; fi
+  "$PY" - "$js" "$BACK_DATE" "$STALE_DAYS" "$CARRY_NODES" "$SERVER_LABEL" > "$res" 2>&1 <<'PY'
+import json, re, sys, datetime as dt
+js, back, stale, carry, label = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4].split(), sys.argv[5]
+d = json.load(open(js))
+now = dt.datetime.now(dt.timezone.utc)
+def t(s):
+    if not s or s.startswith("0001"):
+        return None
+    try:
+        return dt.datetime.fromisoformat(re.sub(r"\.\d+", "", s).replace("Z", "+00:00"))
+    except Exception:
+        return None
+try:
+    backd = dt.date.fromisoformat(back) if back else None
+except Exception:
+    backd = None
+horizon = backd or (now + dt.timedelta(days=30)).date()
+def out(*a):
+    print("|".join(str(x) for x in a))
+st, me = d.get("BackendState"), d.get("Self") or {}
+if st != "Running" or not me.get("Online"):
+    out("FAIL", "H1", f"Tailscale state={st}, online={me.get('Online')}", "open -a Tailscale and check it is logged in")
+else:
+    ke = t(me.get("KeyExpiry"))
+    name = (me.get("DNSName") or "").rstrip(".")
+    ip = (me.get("TailscaleIPs") or ["?"])[0]
+    if ke is None:
+        out("PASS", "H1", f"Tailscale up as {name} ({ip}), key expiry disabled")
+    elif ke.date() <= horizon:
+        out("FAIL", "H1", f"{label}'s Tailscale key expires {ke:%Y-%m-%d}", "admin console > Machines > this machine > Disable key expiry")
+    else:
+        out("WARN", "H1", f"{label}'s Tailscale key expires {ke:%Y-%m-%d}", "disable key expiry for this machine")
+if not carry:
+    out("WARN", "T1", "no carry devices in CARRY_NODES: your laptop's and phone's Tailscale keys aren't checked", "set CARRY_NODES in config/rwp.conf")
+seen = set()
+for p in (d.get("Peer") or {}).values():
+    name = (p.get("DNSName") or p.get("HostName") or "?").split(".")[0]
+    os_, online = p.get("OS", "?"), p.get("Online")
+    ke, ls = t(p.get("KeyExpiry")), t(p.get("LastSeen"))
+    if name in carry:
+        seen.add(name)
+        where = "online" if online else (f"offline, last seen {ls:%Y-%m-%d %H:%M} UTC" if ls else "offline")
+        if ke and ke < now:
+            out("FAIL", "T1", f"{name}: Tailscale key EXPIRED {ke:%Y-%m-%d}", f"log in to Tailscale again on {name}")
+        elif ke and ke.date() <= horizon:
+            out("FAIL", "T1", f"{name}: Tailscale key expires {ke:%Y-%m-%d}, before you are back", f"re-authenticate {name} now, or disable its key expiry")
+        elif ke:
+            out("PASS", "T1", f"{name} ({os_}): key valid to {ke:%Y-%m-%d}; {where}")
+        else:
+            out("PASS", "T1", f"{name} ({os_}): no key expiry; {where}")
+        continue
+    if ke and ke < now:
+        out("WARN", "T2", f"{name} ({os_}): key expired {ke:%Y-%m-%d} - still yours? needed?", "remove it: Tailscale admin console > Machines")
+    elif not online and ls and (now - ls).days >= stale:
+        out("WARN", "T2", f"{name} ({os_}): offline {(now - ls).days} days, key still valid", "remove nodes you no longer use: admin console > Machines")
+for c in carry:
+    if c not in seen:
+        out("FAIL", "T1", f"{c} (a carry device in config) is not in this tailnet", "log the device in, or fix CARRY_NODES in config/rwp.conf")
+PY
+  if [ ! -s "$res" ]; then warn H1 "could not parse tailscale status"; return; fi
+  local lvl id msg fx
+  while IFS='|' read -r lvl id msg fx; do emit "$lvl" "$id" "$msg" "$fx"; done < "$res"
+}
+
+chk_ssh_vnc() {
+  local ip ak n names
+  ip="$("$TS_BIN" ip -4 2>/dev/null | head -1)"; ip="${ip:-$SERVER_TS_IP}"
+  if nc -z -G 3 "$ip" 22 >/dev/null 2>&1; then pass H2 "SSH (Remote Login) answers on $ip:22"
+  else fail H2 "SSH does not answer on $ip:22" "System Settings > General > Sharing > Remote Login ON"; fi
+  ak="$HOME/.ssh/authorized_keys"
+  n="$(grep -cE '^(ssh-|ecdsa-|sk-)' "$ak" 2>/dev/null)"; n="${n:-0}"
+  names="$(awk '/^(ssh-|ecdsa-|sk-)/{print $NF}' "$ak" 2>/dev/null | tr '\n' ' ')"
+  if [ "$n" -ge 2 ]; then pass H2b "$n keys can SSH in: ${names% }"
+  elif [ "$n" -eq 1 ]; then warn H2b "only one key can SSH in (${names% }): lose that device and the Claude link is your only shell" "add your phone's key (SETUP S3)"
+  else fail H2b "no keys in ~/.ssh/authorized_keys" "add $LAPTOP_LABEL's public key"; fi
+  if nc -z -G 3 "$ip" 5900 >/dev/null 2>&1; then pass H3 "Screen Sharing answers on $ip:5900"
+  else fail H3 "Screen Sharing does not answer on $ip:5900" "System Settings > General > Sharing > Screen Sharing ON"; fi
+}
+
+chk_power() {
+  local pm sl ar ds wo src
+  pm="$(pmset -g 2>/dev/null)"
+  sl="$(printf '%s\n' "$pm" | awk '$1=="sleep"{print $2; exit}')"
+  ar="$(printf '%s\n' "$pm" | awk '$1=="autorestart"{print $2; exit}')"
+  ds="$(printf '%s\n' "$pm" | awk '$1=="disksleep"{print $2; exit}')"
+  wo="$(printf '%s\n' "$pm" | awk '$1=="womp"{print $2; exit}')"
+  if [ "$sl" = 0 ] && [ "$ar" = 1 ] && [ "$ds" = 0 ]; then
+    pass H4 "never sleeps, disks never sleep, restarts itself after a power cut (womp $wo)"
+  else
+    fail H4 "power: sleep=$sl disksleep=$ds autorestart=$ar womp=$wo" "sudo pmset -a sleep 0 disksleep 0 autorestart 1 womp 1"
+  fi
+  src="$(pmset -g ps 2>/dev/null | head -1 | sed -E "s/.*'(.*)'.*/\1/")"
+  info PWR "on $src (a UPS or house inverter is invisible to macOS; SETUP S1 records whether it covers the Mac, the router and the modem)"
+}
+
+chk_claude() {
+  # -a: BSD pgrep skips its own ancestors by default, and when Claude runs this script the app IS an ancestor
+  if pgrep -a -f '/Applications/Claude.app/Contents/MacOS/Claude$' >/dev/null 2>&1; then
+    pass H5 "Claude desktop app running (sessions can link to $SERVER_LABEL)"
+  else
+    fail H5 "Claude desktop app not running: no Claude session can reach $SERVER_LABEL" "open -a Claude"
+  fi
+}
+
+chk_disk() {
+  local free vol
+  free="$(df -g /System/Volumes/Data 2>/dev/null | awk 'NR==2{print $4}')"; free="${free:-0}"
+  if [ "$free" -ge "$MIN_FREE_GB" ]; then pass H6 "SSD ${free}G hard-free (floor ${MIN_FREE_GB}G; excludes purgeable)"
+  else fail H6 "SSD only ${free}G hard-free (floor ${MIN_FREE_GB}G): a full disk while away takes services down" "move finished outputs to an external drive"; fi
+  for vol in $REQUIRED_VOLUMES; do
+    if mount | grep -q " on /Volumes/$vol "; then pass H6v "/Volumes/$vol mounted"
+    else fail H6v "/Volumes/$vol is NOT mounted: scripts that point there will fail" "check the drive's cable and power"; fi
+  done
+}
+
+chk_updates() {
+  local fvs au cr
+  fvs="$(fdesetup status 2>/dev/null)"
+  case "$fvs" in *"is On"*) FV=on;; *"is Off"*) FV=off;; *) FV=unknown;; esac
+  au="$(defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates 2>/dev/null)"
+  cr="$(defaults read /Library/Preferences/com.apple.SoftwareUpdate CriticalUpdateInstall 2>/dev/null)"
+  if [ "$au" = 1 ]; then
+    if [ "$FV" = on ]; then
+      fail H8 "automatic macOS updates ON while FileVault is ON: an overnight update restart parks $SERVER_LABEL at the unlock screen, out of reach" "System Settings > General > Software Update > Automatic Updates (i) > Install macOS updates OFF  (or: sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates -bool false)"
+    else
+      warn H8 "automatic macOS updates ON: a restart while away kills every job not managed by launchd" "turn it off, update by hand when you're home"
+    fi
+  elif [ "$au" = 0 ]; then pass H8 "automatic macOS update install is OFF"
+  else warn H8 "could not read the automatic-update setting" "check System Settings > General > Software Update"; fi
+  if [ "$cr" = 1 ]; then info H8b "Security Responses & system files auto-install is ON (these can restart too; your call)"; fi
+}
+
+chk_filevault() {
+  local al
+  if [ "$FV" = on ]; then
+    if [ -n "$LAN_FOOTHOLD" ]; then
+      info S1 "FileVault ON; pre-boot unlock over SSH via $LAN_FOOTHOLD (last tested: ${PREBOOT_TESTED:-never})"
+    else
+      warn S1 "FileVault ON with no pre-boot path: after ANY restart (power cut, update, crash) $SERVER_LABEL waits at the unlock screen, and nothing remote reaches it until someone unlocks it at home" "SETUP S1"
+    fi
+  elif [ "$FV" = off ]; then
+    al="$(defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null)"
+    if [ -n "$al" ]; then info S1 "FileVault OFF; auto-login as $al"
+    else warn S1 "FileVault OFF and no auto-login: a restart stops at the login window, where the Tailscale Mac app doesn't run" "enable auto-login, or use open-source tailscaled"; fi
+  else warn S1 "could not read FileVault status"; fi
+}
+
+chk_network() {
+  local ifc gw port hn
+  ifc="$(route -n get default 2>/dev/null | awk '/interface:/{print $2}')"
+  gw="$(route -n get default 2>/dev/null | awk '/gateway:/{print $2}')"
+  port="$(networksetup -listallhardwareports 2>/dev/null | awk -v d="$ifc" '/^Hardware Port:/{p=substr($0,16)} /^Device:/{if($2==d){print p; exit}}')"
+  CUR_LAN_IP="$(ipconfig getifaddr "$ifc" 2>/dev/null)"
+  case "$port" in
+    "")      warn S2 "no default route: is $SERVER_LABEL offline?";;
+    *Wi-Fi*) warn S2 "on Wi-Fi ($ifc $CUR_LAN_IP, gateway $gw): a cable is steadier for a machine you can't walk up to" "SETUP S7";;
+    *)       pass S2 "on $port ($ifc $CUR_LAN_IP, gateway $gw)";;
+  esac
+  if [ -n "$SERVER_LAN_IP" ] && [ -n "$CUR_LAN_IP" ] && [ "$CUR_LAN_IP" != "$SERVER_LAN_IP" ]; then
+    warn S3 "LAN IP is $CUR_LAN_IP but config says $SERVER_LAN_IP: the address moves (no DHCP reservation?)" "reserve an address on the router (SETUP S6), then update config/rwp.conf"
+  fi
+  hn="$(hostname)"
+  if [ "$hn" != "$SERVER_LOCALHOSTNAME" ] && [ "$hn" != "$SERVER_LOCALHOSTNAME.local" ]; then
+    info S4 "hostname says '$hn' (LocalHostName is $SERVER_LOCALHOSTNAME; RWP uses LocalHostName)"
+  fi
+}
+
+chk_services() {
+  local f="$RWP_HOME/config/services.tsv" sid proj req typ target hint note up lp n=0
+  [ -f "$f" ] || { warn H7 "config/services.tsv missing (copy config/services.tsv.example)"; return; }
+  while IFS="$TAB" read -r sid proj req typ target hint note; do
+    case "$sid" in ''|'#'*) continue;; esac
+    n=$((n+1)); up=0
+    case "$typ" in
+      port)             /usr/sbin/lsof -nP -iTCP:"$target" -sTCP:LISTEN -t >/dev/null 2>&1 && up=1;;
+      proc)             pgrep -a -f "$target" >/dev/null 2>&1 && up=1;;
+      launchd-running)  launchctl print "gui/$UID_N/$target" 2>/dev/null | grep -q "^${TAB}state = running" && up=1;;
+      launchd-periodic) lp="$(launchctl print "gui/$UID_N/$target" 2>/dev/null)"
+                        if [ -n "$lp" ] && ! printf '%s\n' "$lp" | grep -qE "^${TAB}last exit code = [1-9-]"; then up=1; fi;;
+    esac
+    if [ "$up" = 1 ]; then
+      if [ "$req" = info ]; then info H7 "$sid ($proj) up: $note"; else pass H7 "$sid ($proj) up"; fi
+    else
+      case "$req" in
+        yes)   fail H7 "$sid ($proj) DOWN: $note" "$hint";;
+        watch) warn H7 "$sid ($proj) down: $note" "$hint";;
+        *)     info H7 "$sid ($proj) down: $note";;
+      esac
+    fi
+  done < "$f"
+  if [ "$n" = 0 ]; then info H7 "no services registered in config/services.tsv"; fi
+}
+
+chk_heartbeat() {
+  local lp code
+  if [ ! -s "$STATE_DIR/heartbeat.url" ]; then
+    warn S8 "no outside heartbeat: if $SERVER_LABEL dies, nothing tells you" "SETUP S8, then: rwp heartbeat install <ping-url>"
+    return 0
+  fi
+  lp="$(launchctl print "gui/$UID_N/$HEARTBEAT_LABEL" 2>/dev/null)"
+  if [ -z "$lp" ]; then warn S8 "heartbeat configured but its launchd job isn't loaded" "rwp heartbeat install <ping-url>"; return 0; fi
+  code="$(printf '%s\n' "$lp" | awk -F' = ' "/^${TAB}last exit code = /{print \$2; exit}")"
+  case "$code" in
+    0|"(never exited)"|"") pass S8 "outside heartbeat pings every ${HEARTBEAT_EVERY} s (last exit: ${code:-none yet})";;
+    *) warn S8 "outside heartbeat's last ping failed (exit $code)" "see state/heartbeat.err; rwp heartbeat test";;
+  esac
+}
+
+chk_handoff() {
+  local f="$STATE_DIR/handoff_receipts.log" last ep age host lan okall
+  last="$(tail -1 "$f" 2>/dev/null)"
+  if [ -z "$last" ]; then
+    hardfail H9 "no handoff receipt: $LAPTOP_LABEL hasn't proven it can get in from outside" "on $LAPTOP_LABEL, on a phone hotspot: ~/$RWP_REMOTE_DIR/bin/rwp handoff"
+    return 0
+  fi
+  ep="${last%%|*}"; age=$(( ( $(date +%s) - ep ) / 3600 ))
+  host="$(printf '%s' "$last" | awk -F'|' '{print $3}')"
+  lan="$(printf '%s' "$last" | tr '|' '\n' | awk -F= '$1=="lan"{print $2}')"
+  okall="$(printf '%s' "$last" | tr '|' '\n' | awk -F= '$1=="ok"{print $2}')"
+  if [ "$okall" != yes ]; then hardfail H9 "last handoff from $host (${age} h ago) reported failures" "fix what it reported, rerun rwp handoff"
+  elif [ "$lan" != no ]; then hardfail H9 "last handoff from $host (${age} h ago) ran on the home network: proves SSH works, not that you can get in from outside" "rerun on a phone hotspot"
+  elif [ "$age" -gt "$HANDOFF_MAX_HOURS" ]; then hardfail H9 "last remote handoff from $host is ${age} h old (limit ${HANDOFF_MAX_HOURS} h)" "rerun rwp handoff on $LAPTOP_LABEL, off home Wi-Fi"
+  else pass H9 "remote handoff from $host ${age} h ago ($(printf '%s' "$last" | cut -d'|' -f5-))"; fi
+}
+
+chk_repos() {
+  local g r name dirty url ahead last age up
+  for g in "$PROJECTS_DIR"/*/.git "$PROJECTS_DIR"/*/*/.git; do
+    [ -d "$g" ] || continue
+    r="${g%/.git}"; name="${r#"$PROJECTS_DIR"/}"
+    dirty="$(git -C "$r" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+    url="$(git -C "$r" remote get-url origin 2>/dev/null | sed -E 's#//[^/@]*@#//#')"
+    ahead=""; up="no upstream branch"
+    if git -C "$r" rev-parse --abbrev-ref '@{u}' >/dev/null 2>&1; then
+      ahead="$(git -C "$r" rev-list --count '@{u}..HEAD' 2>/dev/null)"; up="${ahead} commit(s) not on the remote"
+    fi
+    last="$(git -C "$r" log -1 --format=%ct 2>/dev/null)"; age=$(( ( $(date +%s) - ${last:-0} ) / 86400 ))
+    if [ -z "$url" ]; then
+      info S5 "$name: local-only repo (no remote); $dirty uncommitted; from $LAPTOP_LABEL, work on it over SSH"
+    elif [ "$age" -le "$ACTIVE_DAYS" ] && { [ "${ahead:-0}" -gt 0 ] || [ "$dirty" -gt 0 ]; }; then
+      warn S5 "$name: $up, $dirty uncommitted, last commit ${age} d ago: $LAPTOP_LABEL can't pull these" "commit + push if you'll need it away (you do this; RWP never touches another repo's git)"
+    else
+      info S5 "$name: $up, $dirty uncommitted, last commit ${age} d ago"
+    fi
+  done
+}
+
+chk_jobs() {
+  local n pid et cmd
+  ps -axo pid=,etime=,user=,command= 2>/dev/null | awk -v me="$(id -un)" -v min="$JOB_MIN_SECS" '
+    function secs(e,   d, r, a, n) { d = 0; r = e
+      if (index(e, "-")) { split(e, a, "-"); d = a[1]; r = a[2] }
+      n = split(r, a, ":")
+      if (n == 3) return d*86400 + a[1]*3600 + a[2]*60 + a[3]
+      if (n == 2) return d*86400 + a[1]*60 + a[2]
+      return 0 }
+    $3 == me {
+      cmd = $0; sub(/^ *[0-9]+ +[^ ]+ +[^ ]+ +/, "", cmd)
+      if (cmd !~ /(python|node|bash |zsh |sh |rsync|scp|ssh |tmux|caffeinate|ollama|java|ruby)/) next
+      if (cmd ~ /(\/Applications\/|\/System\/|Application Support\/Claude\/|Helper|desktop-commander|MacOS-MCP|macos-mcp|-mcp|mcp-server|uv tool uvx|\.cache\/uv\/archive|claude-code\/bin|ShipIt|bin\/rwp|ssh-agent)/) next
+      if (secs($2) < min) next
+      printf "%s|%s|%s\n", $1, $2, substr(cmd, 1, 170) }' > "$STATE_DIR/.jobs"
+  n="$(wc -l < "$STATE_DIR/.jobs" | tr -d ' ')"
+  info S6 "$n job(s) running longer than $((JOB_MIN_SECS / 60)) min (they keep running; the away sheet lists them)"
+  while IFS='|' read -r pid et cmd; do info S6 "  pid $pid, up $et: $cmd"; done < "$STATE_DIR/.jobs"
+}
+
+is_public() {
+  case "$1" in
+    10.*|127.*|0.*|169.254.*|192.168.*|22[4-9].*|23[0-9].*|24[0-9].*|25[0-5].*) return 1;;
+    172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 1;;
+    100.6[4-9].*|100.[7-9][0-9].*|100.1[01][0-9].*|100.12[0-7].*) return 1;;
+  esac
+  return 0
+}
+chk_money() {
+  local m="$STATE_DIR/.money" ip src any=0
+  : > "$m"
+  /usr/sbin/lsof -nP -iTCP -sTCP:ESTABLISHED 2>/dev/null \
+    | awk '$1 ~ /^(ssh|rsync|scp|sftp|mosh)/ { split($9, a, "->"); split(a[2], b, ":"); if (b[1] != "") print b[1] " ssh-session" }' >> "$m"
+  # IPs in the command lines of your own jobs (app bundles skipped: their 4-part version strings look like IPs)
+  ps -axo command= 2>/dev/null | grep -vE '^(/Applications/|/System/|/Library/|/usr/libexec/|/usr/sbin/)' | grep -v grep \
+    | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | awk -F. '$4 != "0" && $4 != "255" {print $0 " job-command-line"}' >> "$m"
+  for ip in $(awk '{print $1}' "$m" | sort -u); do
+    is_public "$ip" || continue
+    src="$(awk -v i="$ip" '$1==i{print $2}' "$m" | sort -u | tr '\n' ' ')"
+    warn S7 "$ip (${src% }): a remote host in use. Rented box? Is it billing?" "stop it, or list it in the away sheet with its hourly cost, expected end and how to stop it from your phone (only you stop them)"
+    any=1
+  done
+  if [ "$any" = 0 ]; then info S7 "no SSH/rsync sessions or job command lines pointing at public IPs"; fi
+}
+
+run_checks() {   # $1 = full (departure/preflight) | health (status while away, return)
+  say "RWP checks on $(scutil --get ComputerName 2>/dev/null) - macOS $(sw_vers -productVersion 2>/dev/null) - up $(uptime | sed -E 's/.*up (.*), [0-9]+ users?.*/\1/') - $NOW"
+  chk_tailscale; chk_ssh_vnc; chk_power; chk_claude; chk_disk
+  chk_updates; chk_filevault; chk_network; chk_services; chk_heartbeat
+  if [ "${1:-full}" = full ]; then chk_handoff; chk_repos; chk_jobs; fi
+  chk_money
+}
+summary() {
+  loud ""
+  loud "SUMMARY  pass $NPASS  warn $NWARN  fail $NFAIL${ACCEPTED:+  accepted: ${ACCEPTED% }}"
+  if [ -n "$FAILS" ]; then loud "FAILING  ${FAILS% }"; fi
+}
+load_accepted() {   # while AWAY, the risks accepted at activation stay accepted
+  local f="$STATE_DIR/accepted.tsv" id
+  [ -f "$f" ] || return 0
+  ACCEPT_TEXT="$(cat "$f")$NL"
+  for id in $(awk -F"$TAB" 'NF{print $1}' "$f"); do ACCEPT_IDS="$ACCEPT_IDS $id"; done
+}
+accepted_list() { if [ -n "$ACCEPT_TEXT" ]; then printf '%s' "$ACCEPT_TEXT" | awk -F"$TAB" 'NF{printf "%s%s (%s)", sep, $1, $2; sep="; "}'; else printf 'none'; fi; }
+
+# ---- state writers ----------------------------------------------------------------
+set_state_block() {   # replace the block between the RWP:MODE markers in STATE.md
+  local blk="$STATE_DIR/.block" tmp="$STATE_DIR/.state"
+  printf '%s\n' "$1" > "$blk"
+  awk -v bf="$blk" '
+    /<!-- RWP:MODE:BEGIN -->/ { print; while ((getline l < bf) > 0) print l; skip = 1; next }
+    /<!-- RWP:MODE:END -->/   { skip = 0 }
+    !skip { print }' "$RWP_HOME/STATE.md" > "$tmp" && mv "$tmp" "$RWP_HOME/STATE.md"
+}
+next_trip() {
+  local n
+  n="$(ls "$RWP_HOME"/LOG/RWP-T*.md 2>/dev/null | sed -E 's/.*RWP-T([0-9]+)\.md$/\1/' | sort -n | tail -1)"
+  echo $(( ${n:-0} + 1 ))
+}
+write_away_sheet() {
+  local trip="${1:-draft}" verdict="${2:-DRAFT, not active}"
+  {
+    echo "# AWAY SHEET - $trip - $verdict"
+    echo "Generated $NOW on $SERVER_LABEL. Leave ${LEAVE:-?} - back ${BACK_DATE:-?} - carrying ${DEVICES:-?}"
+    echo
+    echo "## Reach $SERVER_LABEL, in this order"
+    echo "1. Claude: the pinned \"$CONTROL_CHAT\" conversation (linked to $SERVER_LABEL)"
+    echo "2. ssh $SERVER_SSH    long work: ssh -t $SERVER_SSH tmux new -A -s rwp"
+    echo "3. Screen Sharing: vnc://$SERVER_TS_NAME"
+    echo "Tailnet $SERVER_TS_IP ($SERVER_TS_FQDN) - LAN ${CUR_LAN_IP:-$SERVER_LAN_IP} (home only) - status: ~/$RWP_REMOTE_DIR/bin/rwp status"
+    echo
+    echo "## Money running (only you stop these)"
+    grep -E '^\[(WARN|INFO)\] S7 ' "$OUT" | sed -E 's/^\[(WARN|INFO)\] S7 +/- /'
+    echo "- Add by hand: provider, box, hourly cost, expected end, most you will spend, how to stop it from the phone"
+    echo
+    echo "## Left running at this moment"
+    grep -E '^\[INFO\] S6 ' "$OUT" | sed -E 's/^\[INFO\] S6 +/- /'
+    echo
+    echo "## Services"
+    grep -E '^\[(PASS|WARN|FAIL|ACPT|INFO)\] H7 ' "$OUT" | sed -E 's/^\[([A-Z]+)\] H7 +/- \1 /'
+    echo
+    echo "## Accepted risks"
+    if [ -n "$ACCEPT_TEXT" ]; then printf '%s' "$ACCEPT_TEXT" | awk -F"$TAB" 'NF{print "- " $1 ": " $2}'; else echo "- none"; fi
+    echo
+    echo "## Open warnings"
+    grep -E '^\[WARN\] ' "$OUT" | sed -E 's/^\[WARN\] +/- /'
+    echo
+    echo "## When something breaks"
+    echo "runbooks/: $(cd "$RWP_HOME/runbooks" 2>/dev/null && ls ./*.md 2>/dev/null | sed 's#^\./##' | tr '\n' ' ')"
+  } > "$STATE_DIR/AWAY_SHEET.md"
+}
+write_trip_log() {
+  local trip="$1" verdict="$2" f="$RWP_HOME/LOG/RWP-$1.md"
+  [ -f "$f" ] && return 0
+  {
+    echo "# RWP-$trip - $(date '+%Y-%m-%d')"
+    echo
+    echo "Leave ${LEAVE:-?} - back $BACK_DATE - carrying ${DEVICES:-?} - $verdict"
+    echo
+    echo "## Activation ($NOW)"
+    echo "- pass $NPASS, warn $NWARN, fail 0, accepted: $(accepted_list)"
+    echo "- full record on $SERVER_LABEL: state/$(basename "$OUT"), state/AWAY_SHEET.md"
+    echo
+    echo "## Remote sessions (one line each: time - device - what changed)"
+    echo
+    echo "## Incidents"
+    echo
+    echo "## Return"
+  } > "$f"
+}
+ledger_push() {   # commit STATE + the trip log in this repo, push to its (private) remote
+  local msg="$1"; shift
+  [ "$AUTO_PUSH" = 1 ] || return 0
+  git -C "$RWP_HOME" rev-parse --git-dir >/dev/null 2>&1 || { loud "Ledger: not a git repo; nothing committed."; return 0; }
+  local remote=""; remote="$(git -C "$RWP_HOME" remote get-url origin 2>/dev/null)"
+  if [ -n "$remote" ] && ! git -C "$RWP_HOME" pull -q --ff-only >/dev/null 2>&1; then
+    loud "Ledger: couldn't fast-forward from origin first (offline, or local edits); committing on top of the local copy."
+  fi
+  git -C "$RWP_HOME" add -- "$@" >/dev/null 2>&1
+  if ! git -C "$RWP_HOME" commit -q -m "$msg" -- "$@" >/dev/null 2>&1; then loud "Ledger: nothing new to commit."; return 0; fi
+  if [ -z "$remote" ]; then loud "Ledger: committed locally (no remote)."; return 0; fi
+  if git -C "$RWP_HOME" push -q >/dev/null 2>&1; then loud "Ledger: committed and pushed ($msg)."
+  else loud "Ledger: committed locally; push FAILED (offline? auth?), so the remote copy is behind."; fi
+}
+notify_phone() {
+  [ -n "$NTFY_URL" ] || return 2
+  curl -fsS -m 10 -H "Title: RWP" -d "$1" "$NTFY_URL/$NTFY_TOPIC" >/dev/null 2>&1
+}
+
+# ---- commands ------------------------------------------------------------------------
+cmd_preflight() {
+  on_server_or_ssh preflight "$@"
+  parse_args "$@"
+  OUT="$STATE_DIR/preflight_$STAMP.txt"; : > "$OUT"
+  run_checks full; summary
+  [ "$NFAIL" -eq 0 ]
+}
+
+cmd_depart() {
+  on_server_or_ssh depart "$@"
+  parse_args "$@"
+  if [ -z "$BACK_DATE" ]; then echo "rwp depart: --back YYYY-MM-DD is required (key expiries are checked against it)" >&2; exit 2; fi
+  OUT="$STATE_DIR/depart_$STAMP.txt"; : > "$OUT"
+  run_checks full; summary
+  if [ "$MODE_ACTIVATE" != 1 ]; then
+    write_away_sheet
+    loud ""
+    loud "DRAFT ONLY, not active. Next: clear the FAILs (or accept one by name: --accept \"ID: reason\"),"
+    loud "run 'rwp handoff' on $LAPTOP_LABEL off home Wi-Fi, then: rwp depart ... --activate"
+    return 1
+  fi
+  if [ "$NFAIL" -gt 0 ]; then
+    loud ""
+    loud "RWP NOT ACTIVE. Failing: ${FAILS% }. Nothing was changed. Fix them, or accept by name, and rerun."
+    notify_phone "RWP NOT ACTIVE - failing: ${FAILS% }" || true
+    return 1
+  fi
+  local trip verdict rc
+  trip="$(sed -n 's/^\*\*Trip:\*\* \(T[0-9]*\).*/\1/p' "$RWP_HOME/STATE.md" | head -1)"
+  if grep -q '^\*\*Mode:\*\* AWAY' "$RWP_HOME/STATE.md" && [ -n "$trip" ]; then
+    printf '\n- Re-activated %s: back %s, carrying %s\n' "$NOW" "$BACK_DATE" "${DEVICES:-?}" >> "$RWP_HOME/LOG/RWP-$trip.md"
+  else
+    trip="T$(next_trip)"
+  fi
+  ACCEPTED="${ACCEPTED% }"
+  verdict="ACTIVE"; [ -n "$ACCEPTED" ] && verdict="ACTIVE with accepted risks: $ACCEPTED"
+  write_away_sheet "$trip" "$verdict"
+  write_trip_log "$trip" "$verdict"
+  printf '%s' "$ACCEPT_TEXT" > "$STATE_DIR/accepted.tsv"
+  set_state_block "**Mode:** AWAY - $verdict
+**Trip:** $trip - leave ${LEAVE:-?} - back $BACK_DATE - carrying ${DEVICES:-?}
+**Activated:** $NOW - away sheet: state/AWAY_SHEET.md (on $SERVER_LABEL) - log: LOG/RWP-$trip.md
+**Accepted risks:** $(accepted_list)
+**Open warnings at activation:** $NWARN (listed in the away sheet)"
+  loud ""
+  loud "RWP $verdict. Trip $trip, back $BACK_DATE."
+  ledger_push "RWP $trip depart: $verdict" STATE.md "LOG/RWP-$trip.md"
+  notify_phone "RWP $verdict - $trip, back $BACK_DATE. 0 fails, $NWARN warnings."; rc=$?
+  case "$rc" in
+    0) loud "Confirmation pushed to ntfy topic '$NTFY_TOPIC'.";;
+    2) loud "No push configured (NTFY_URL is empty): the phone was not told.";;
+    *) loud "Push FAILED ($NTFY_URL/$NTFY_TOPIC): the phone did NOT get the confirmation.";;
+  esac
+}
+
+cmd_handoff() {
+  if [ "$(role)" = server ]; then echo "rwp handoff runs on $LAPTOP_LABEL: it tests the path TO $SERVER_LABEL." >&2; exit 2; fi
+  OUT="$STATE_DIR/handoff_$STAMP.txt"; : > "$OUT"
+  local me lan=unknown route="?" sshok=no vncok=no fv=unknown ke pong ok
+  me="$(scutil --get LocalHostName 2>/dev/null)"
+  say "RWP handoff: $me -> $SERVER_TS_NAME - $NOW"
+  if [ -z "$TS_BIN" ] || ! "$TS_BIN" status >/dev/null 2>&1; then
+    fail HO1 "Tailscale is not running / logged in on this Mac" "open Tailscale and log in"
+  else
+    ke=""
+    if [ -n "$PY" ]; then ke="$("$TS_BIN" status --json 2>/dev/null | "$PY" -c 'import json,sys; print((json.load(sys.stdin).get("Self") or {}).get("KeyExpiry") or "")' 2>/dev/null)"; fi
+    pass HO1 "Tailscale up on this Mac${ke:+ (its key expires ${ke%%T*})}"
+    pong="$("$TS_BIN" ping --c 5 "$SERVER_TS_NAME" 2>&1 | grep 'pong from' | tail -1)"
+    if [ -z "$pong" ]; then
+      fail HO2 "no Tailscale pong from $SERVER_TS_NAME" "is $SERVER_LABEL online? Tailscale admin console > Machines"
+    else
+      route="$(printf '%s' "$pong" | sed -E 's/.* via ([^ ]+) in .*/\1/')"
+      case "$route" in
+        192.168.*|10.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*)
+          lan=yes; warn HO2 "reached $SERVER_LABEL via $route: you are on the home network, which proves nothing about remote access" "rerun on a phone hotspot";;
+        *) lan=no; pass HO2 "reached $SERVER_LABEL via $route (off the home network)";;
+      esac
+    fi
+  fi
+  # shellcheck disable=SC2086
+  if ssh $SSH_OPTS "$SERVER_SSH" true 2>>"$OUT"; then sshok=ok; pass HO3 "SSH to $SERVER_SSH works (key auth)"
+  else fail HO3 "SSH to $SERVER_SSH failed" "check the key and ~/.ssh/config (runbooks)"; fi
+  if nc -z -G 5 "$SERVER_TS_NAME" 5900 >/dev/null 2>&1; then vncok=ok; pass HO4 "Screen Sharing answers on $SERVER_TS_NAME:5900 (open vnc://$SERVER_TS_NAME once to be sure the login works)"
+  else fail HO4 "Screen Sharing port closed on $SERVER_TS_NAME" "turn on Screen Sharing on $SERVER_LABEL"; fi
+  case "$(fdesetup status 2>/dev/null)" in
+    *"is On"*) fv=on; pass HO5 "FileVault ON on this Mac (it travels)";;
+    *) fv=off; warn HO5 "FileVault is not ON on this Mac: a lost laptop means readable keys and code" "System Settings > Privacy & Security > FileVault";;
+  esac
+  if [ "$sshok" = ok ]; then
+    # shellcheck disable=SC2086
+    scp -q $SSH_OPTS "$SERVER_SSH:$RWP_REMOTE_DIR/STATE.md" "$STATE_DIR/server_STATE.md" 2>/dev/null && info HO6 "cached $SERVER_LABEL's STATE.md in state/server_STATE.md"
+    # shellcheck disable=SC2086
+    scp -q $SSH_OPTS "$SERVER_SSH:$RWP_REMOTE_DIR/state/AWAY_SHEET.md" "$STATE_DIR/server_AWAY_SHEET.md" 2>/dev/null && info HO6 "cached the away sheet in state/server_AWAY_SHEET.md"
+  fi
+  if git -C "$RWP_HOME" remote get-url origin >/dev/null 2>&1; then
+    if git -C "$RWP_HOME" pull -q --ff-only >/dev/null 2>&1; then info HO7 "RWP docs on this Mac updated from origin"
+    else warn HO7 "couldn't update RWP docs on this Mac from origin" "git -C ~/$RWP_REMOTE_DIR pull"; fi
+  fi
+  summary
+  ok=no; [ "$NFAIL" -eq 0 ] && ok=yes
+  if [ "$sshok" = ok ]; then
+    # shellcheck disable=SC2029,SC2086,SC2088
+    if ssh $SSH_OPTS "$SERVER_SSH" "mkdir -p ~/$RWP_REMOTE_DIR/state && printf '%s\n' '$(date +%s)|$NOW|$me|lan=$lan|route=$route|ssh=$sshok|vnc=$vncok|fv=$fv|ok=$ok' >> ~/$RWP_REMOTE_DIR/state/handoff_receipts.log"; then
+      loud "Receipt left on $SERVER_LABEL (ok=$ok, lan=$lan). Its 'depart --activate' reads it."
+    fi
+  else
+    loud "No receipt: SSH failed, so $SERVER_LABEL can't be told."
+  fi
+  [ "$ok" = yes ]
+}
+
+cmd_status() {
+  local cache="$STATE_DIR/last_status.txt"
+  if [ "$(role)" != server ]; then
+    # shellcheck disable=SC2029,SC2086,SC2088
+    if ssh $SSH_OPTS "$SERVER_SSH" "~/$RWP_REMOTE_DIR/bin/rwp status" > "$cache.new" 2>&1; then
+      mv "$cache.new" "$cache"; cat "$cache"
+      # shellcheck disable=SC2086
+      scp -q $SSH_OPTS "$SERVER_SSH:$RWP_REMOTE_DIR/state/AWAY_SHEET.md" "$STATE_DIR/server_AWAY_SHEET.md" 2>/dev/null
+      return 0
+    fi
+    echo "$SERVER_LABEL did not answer over SSH ($SERVER_SSH)."
+    if [ -n "$TS_BIN" ]; then "$TS_BIN" status 2>/dev/null | grep -i "$SERVER_TS_NAME" | sed 's/^/tailscale: /'; fi
+    echo "Last cached status ($(stat -f '%Sm' "$cache" 2>/dev/null || echo 'none cached')):"
+    cat "$cache" 2>/dev/null
+    echo "Away sheet copy: $STATE_DIR/server_AWAY_SHEET.md"
+    echo "Next: the 'unreachable' runbook in runbooks/"
+    return 1
+  fi
+  QUIET=1; OUT="$STATE_DIR/status_$STAMP.txt"; : > "$OUT"
+  sed -n '/RWP:MODE:BEGIN/,/RWP:MODE:END/p' "$RWP_HOME/STATE.md" | grep -v 'RWP:MODE'
+  if grep -q '^\*\*Mode:\*\* AWAY' "$RWP_HOME/STATE.md"; then
+    BACK_DATE="$(sed -n 's/^\*\*Trip:\*\*.* back \([0-9]\{4\}-[0-9]\{2\}-[0-9]\{2\}\).*/\1/p' "$RWP_HOME/STATE.md" | head -1)"
+    load_accepted
+    loud "Checked $NOW (health only; problems shown, accepted risks marked ACPT):"
+    run_checks health
+  else
+    loud "Checked $NOW (mode HOME; problems shown):"
+    run_checks full
+  fi
+  summary
+}
+
+cmd_notify() {
+  on_server_or_ssh notify "$@"
+  notify_phone "${*:-RWP test push, $NOW}"
+  case "$?" in
+    0) echo "sent to ntfy topic '$NTFY_TOPIC'";;
+    2) echo "no push configured (NTFY_URL is empty in config/rwp.conf)" >&2; return 1;;
+    *) echo "push failed ($NTFY_URL/$NTFY_TOPIC)" >&2; return 1;;
+  esac
+}
+
+cmd_return() {
+  on_server_or_ssh return "$@"
+  local trip
+  OUT="$STATE_DIR/return_$STAMP.txt"; : > "$OUT"
+  trip="$(sed -n 's/^\*\*Trip:\*\* \(T[0-9]*\).*/\1/p' "$RWP_HOME/STATE.md" | head -1)"
+  run_checks health; chk_repos; summary
+  set_state_block "**Mode:** HOME
+**As of:** $NOW (back from ${trip:-no recorded trip})"
+  if [ -f "$STATE_DIR/accepted.tsv" ]; then mv "$STATE_DIR/accepted.tsv" "$STATE_DIR/accepted_${trip:-last}.tsv"; fi
+  if [ -n "$trip" ] && [ -f "$RWP_HOME/LOG/RWP-$trip.md" ]; then
+    printf '\n- Back %s: pass %s, warn %s, fail %s (state/%s on %s). Checklist below still to tick.\n' \
+      "$NOW" "$NPASS" "$NWARN" "$NFAIL" "$(basename "$OUT")" "$SERVER_LABEL" >> "$RWP_HOME/LOG/RWP-$trip.md"
+    ledger_push "RWP $trip return" STATE.md "LOG/RWP-$trip.md"
+  else
+    ledger_push "RWP return" STATE.md
+  fi
+  cat <<EOF
+
+RETURN CHECKLIST (PROTOCOL.md section 3)
+[ ] Anything failing above broke while you were away: note it in LOG/RWP-${trip:-T?}.md
+[ ] Reconcile code between $LAPTOP_LABEL and $SERVER_LABEL (each repo by its own rules)
+[ ] Restore anything you switched off for the trip
+[ ] Used a device that isn't yours? Rotate what you typed on it, remove any Tailscale node you added, sign out stray sessions
+[ ] Close the trip log; protocol gaps go to DECISIONS.md / SETUP.md
+Mode is now HOME.
+EOF
+}
+
+cmd_heartbeat() {   # outside dead-man's switch: the home Mac pings a monitor; silence alerts you
+  local sub="${1:-}" url="${2:-}" dry="${3:-}" code
+  [ "$(role)" = server ] || { echo "rwp heartbeat runs on $SERVER_LABEL" >&2; exit 2; }
+  case "$sub" in
+    install)
+      case "$url" in https://*) ;; *) echo "usage: rwp heartbeat install https://<ping-url> [--dry-run]" >&2; exit 2;; esac
+      mkdir -p "$(dirname "$HB_PLIST")"
+      local tmp="$STATE_DIR/.hb.plist"
+      cat > "$tmp" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$HEARTBEAT_LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/curl</string><string>-fsS</string><string>-m</string><string>10</string>
+    <string>--retry</string><string>3</string><string>-o</string><string>/dev/null</string>
+    <string>$url</string>
+  </array>
+  <key>StartInterval</key><integer>$HEARTBEAT_EVERY</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardErrorPath</key><string>$STATE_DIR/heartbeat.err</string>
+</dict>
+</plist>
+EOF
+      if ! plutil -lint "$tmp" >/dev/null; then echo "rwp: generated plist failed plutil -lint" >&2; exit 1; fi
+      if [ "$dry" = "--dry-run" ]; then
+        echo "DRY RUN: would write $HB_PLIST (plist lints OK), ping every ${HEARTBEAT_EVERY} s to ${url%%/*}//$(printf '%s' "${url#*://}" | cut -d/ -f1)/..."
+        rm -f "$tmp"; return 0
+      fi
+      printf '%s\n' "$url" > "$STATE_DIR/heartbeat.url"; chmod 600 "$STATE_DIR/heartbeat.url"
+      launchctl bootout "gui/$UID_N/$HEARTBEAT_LABEL" >/dev/null 2>&1 || true
+      mv "$tmp" "$HB_PLIST"
+      if launchctl bootstrap "gui/$UID_N" "$HB_PLIST"; then
+        sleep 3
+        code="$(launchctl print "gui/$UID_N/$HEARTBEAT_LABEL" 2>/dev/null | awk -F' = ' "/^${TAB}last exit code = /{print \$2; exit}")"
+        echo "heartbeat loaded as $HEARTBEAT_LABEL; first ping exit: ${code:-pending}. Check the monitor shows it up."
+      else
+        echo "rwp: launchctl bootstrap failed" >&2; exit 1
+      fi;;
+    test)
+      [ -s "$STATE_DIR/heartbeat.url" ] || { echo "no heartbeat configured" >&2; exit 1; }
+      if curl -fsS -m 10 -o /dev/null "$(cat "$STATE_DIR/heartbeat.url")"; then echo "ping OK"; else echo "ping FAILED" >&2; exit 1; fi;;
+    remove)
+      launchctl bootout "gui/$UID_N/$HEARTBEAT_LABEL" >/dev/null 2>&1 || true
+      if [ -f "$HB_PLIST" ]; then mv "$HB_PLIST" "$STATE_DIR/removed-$STAMP-$HEARTBEAT_LABEL.plist"; fi
+      if [ -f "$STATE_DIR/heartbeat.url" ]; then mv "$STATE_DIR/heartbeat.url" "$STATE_DIR/removed-$STAMP-heartbeat.url"; fi
+      echo "heartbeat unloaded; plist moved into state/. Pause or delete the check on the monitor too, or it will alert.";;
+    *) echo "usage: rwp heartbeat install https://<ping-url> [--dry-run] | test | remove" >&2; exit 2;;
+  esac
+}
+
+case "${1:-help}" in
+  preflight) shift; cmd_preflight "$@";;
+  depart)    shift; cmd_depart "$@";;
+  handoff)   shift; cmd_handoff "$@";;
+  status)    shift; cmd_status "$@";;
+  notify)    shift; cmd_notify "$@";;
+  return)    shift; cmd_return "$@";;
+  heartbeat) shift; cmd_heartbeat "$@";;
+  help|-h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//';;
+  *) echo "rwp: unknown command '$1' (rwp help)" >&2; exit 2;;
+esac
