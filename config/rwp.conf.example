@@ -36,6 +36,5 @@ HEARTBEAT_EVERY=300
 # Commit STATE + the trip log and push to your PRIVATE remote on depart/return (DECISIONS D13)
 AUTO_PUSH=0
 
-# FileVault pre-boot way in (SETUP Later)
-LAN_FOOTHOLD=""                                 # e.g. "raspberry pi subnet router"
-PREBOOT_TESTED=""                               # date you last unlocked FileVault over SSH at the pre-boot screen
+# Ways back in after a restart (runbooks/restart-recovery.md). A foothold is found on the tailnet by itself: no setting.
+PREBOOT_TESTED=""                               # date 'rwp unlock' last got the home Mac past the unlock screen (SETUP E3b)

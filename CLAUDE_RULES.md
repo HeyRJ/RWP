@@ -8,7 +8,7 @@
 2. RWP reads other projects; it never stops, restarts or reconfigures their processes, and never touches their git state. Each project's own rules still apply.
 3. No secret values in this repo, ever: credentials appear by name and location only (`inventory/CREDENTIALS_MAP.md`).
 4. Never change power/sleep, FileVault, Tailscale, SSH, Screen Sharing, firewall, network or update settings. Hand the user the command or the System Settings path; they run it (most need sudo anyway).
-5. Never reboot, shut down or log out the home Mac as part of RWP. The reboot test (`SETUP.md` S11) is the user's to schedule, when nothing is running.
+5. Never reboot, shut down or log out the home Mac. `rwp restart` and `rwp unlock` are the user's to run; the assistant may run `rwp restart --dry-run`, which only reads. The user types their macOS password themselves: never ask for it, never put it in a command or a file. The restart tests (`SETUP.md` E3) are the user's to schedule, when nothing is running.
 6. Run `date` before any statement about time ("tonight", "before you leave", ETAs).
 7. Git: only this repo, and only to a private remote. Commit ledger files by explicit filename.
 8. Report with evidence: ACTIVE / NOT ACTIVE comes from the script's output, quoted. Say what was verified and what was assumed.

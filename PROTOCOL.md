@@ -16,6 +16,7 @@ Order matters. Everything that needs your hands happens first. Background jobs m
 | ID | Check | Blocks ACTIVE? | Fix |
 |---|---|---|---|
 | R1 | Did the home Mac restart since the last check, and which long-running jobs from then are gone? | no | bring back what you need; launchd for what must survive (SETUP S22) |
+| L1 | Someone is logged in at the home Mac's screen (at the login window nothing of yours runs: Tailscale app, Claude, LaunchAgents) | yes | log in by Screen Sharing (`runbooks/restart-recovery.md` B) |
 | H1 | Tailscale running on the home Mac, online, its key expiry disabled | yes | `open -a Tailscale`; admin console → disable key expiry |
 | T1 | Your carry devices' Tailscale keys valid past your return date | yes | re-authenticate that device now |
 | T2 | No stale nodes or expired keys in the tailnet | no | remove them in the admin console |
@@ -28,7 +29,9 @@ Order matters. Everything that needs your hands happens first. Background jobs m
 | H7 | Registered services up (`config/services.tsv`) | only `required=yes` | the restart hint in the registry (you run it) |
 | H8 | Automatic macOS updates OFF (an update restart logs back in by itself, but kills every job started by hand) | no | Software Update → Automatic Updates → Install macOS updates OFF |
 | H9 | Handoff receipt: from the laptop, off the home network, < 24 h old | yes, at activation | on the laptop, on a phone hotspot: `bin/rwp handoff` |
-| S1 | FileVault ON has a pre-boot way in | no, but see §4 | `SETUP.md` 1 and Later |
+| W1 | After `rwp restart` (stops at the login window): a way to log in from outside, i.e. Tailscale before login or a foothold | no, but see §4 | `runbooks/tailscaled.md` or `runbooks/foothold.md` |
+| W2 | After a power cut beyond the UPS, a crash or a plain restart (the unlock screen): a way to reach it from outside, i.e. a foothold routing to the Mac's LAN address | no, but see §4 | `runbooks/foothold.md` |
+| S1 | Only if FileVault is OFF: automatic login set | no | `SETUP.md` 1 |
 | S2/S3 | Wired network; LAN IP matches config | no | `SETUP.md` 2 |
 | S5 | Repos with unpushed or uncommitted work you'll want away | no | you commit/push; RWP never does |
 | S6 | Jobs running longer than 30 min (listed, not stopped) | no | detached + logged + monitor line |
@@ -57,6 +60,8 @@ Order matters. Everything that needs your hands happens first. Background jobs m
 - Check in with `bin/rwp status` from the laptop. It caches the answer, so you keep the last known state if the Mac goes dark.
 - Every remote session gets a line in the trip log: time, device, what changed.
 - Return date moves: rerun `bin/rwp depart --back <new date> … --activate`. It re-checks key expiries against the new date and keeps the same trip.
+- A restart you need while away: `rwp restart --dry-run` from the laptop first. With W1 WARN it asks you to type `RESTART`, because nothing gets the Mac back from the login window until someone at home logs in.
+- It restarted on its own: `rwp status` from the laptop; if the Mac doesn't answer but its LAN address does, `rwp unlock` (`runbooks/restart-recovery.md`).
 
 ## 3. RETURN: `bin/rwp return`
 1. Checks again: what broke while you were away.
@@ -67,7 +72,7 @@ Order matters. Everything that needs your hands happens first. Background jobs m
 6. STATE → HOME (the script does this).
 
 ## 4. What ACTIVE does not cover (until SETUP closes them)
-- **A restart that isn't an update, while FileVault is ON**: power out longer than the UPS lasts, a crash, a plain restart. The Mac waits at the unlock screen; Tailscale, Claude, SSH and every service stay down until someone unlocks it (at the keyboard, or over SSH from the home network; SETUP Later for from anywhere). Update restarts log back in by themselves. Restarts you trigger remotely: `sudo fdesetup authrestart`.
+- **A restart that isn't an update, while FileVault is ON** (W1, W2): power out longer than the UPS lasts, a crash or a plain restart leaves the Mac at the unlock screen; `rwp restart` leaves it at the login window. Either way Tailscale, Claude and every service stay down until you get past it: `rwp unlock` and Screen Sharing work from home Wi-Fi, and from outside only through a foothold (or, for the login window, Tailscale before login). Update restarts log back in by themselves.
 - **Jobs started by hand.** Any restart kills them; only launchd jobs come back. `rwp status` lists what died (R1).
 - **A dead Mac nobody notices**, until the outside heartbeat exists (SETUP 4).
 - **Anything that doesn't live on the home Mac**, like production on a cloud platform: give it its own break-glass line in `runbooks/borrowed-device.md`.

@@ -8,7 +8,7 @@ It's a handful of markdown files and one read-only bash script, made to be run w
 
 Remote access that works on your home Wi-Fi tells you nothing about the hotel. What strands people is boring and predictable:
 
-- **A restart while you're away.** With FileVault on, a power cut longer than your UPS lasts, a crash or a plain restart leaves the Mac at the unlock screen: no Tailscale, no SSH, no Screen Sharing until someone types the password. (A macOS update restart logs back in by itself, but kills everything you started by hand.)
+- **A restart while you're away.** With FileVault on, a power cut longer than your UPS lasts, a crash or a plain restart leaves the Mac at the unlock screen, and even a careful remote restart (`fdesetup authrestart`) stops at the login window: either way the Tailscale app isn't running, so from outside the house nothing reaches it. (A macOS update restart logs back in by itself, but kills everything you started by hand.) RWP has a command for each way back in and tells you which ones work from where you'll be.
 - **Testing from home.** On your own network the local path hides a broken remote path. It works right up until you leave.
 - **One way in.** Only the laptop's SSH key can log in. Lose the laptop and you're locked out of your own machine.
 - **Silence.** Your alerts come from the machine that just died, so a dead Mac looks exactly like "all quiet".
@@ -25,9 +25,10 @@ STATE.md                       HOME or AWAY and the current trip (the script wri
 PROTOCOL.md                    depart → away → return, and what "ACTIVE" means
 SETUP.md                       one-time setup in order, and the checks that prove it
 DECISIONS.md                   why it's built this way, and what was rejected
-bin/rwp                        preflight · depart · handoff · status · notify · return · heartbeat
+bin/rwp                        preflight · depart · handoff · status · notify · return · heartbeat · restart · unlock
 config/*.example               your names, addresses and services
-runbooks/                      laptop · phone · borrowed device · lost device · home Mac unreachable · home contact
+runbooks/                      laptop · phone · borrowed device · lost device · home Mac unreachable ·
+                               restart recovery · foothold · tailscaled · home contact
 inventory/CREDENTIALS_MAP.md   what credential lives where, and how to revoke it (names only)
 LOG/                           one file per setup session and per trip
 ```
@@ -54,7 +55,7 @@ LOG/                           one file per setup session and per trip
 
 - **Checks are read-only**: `pmset`, `fdesetup`, `tailscale status`, `launchctl print`, `lsof`, `ps`, `git status`, `defaults read`. Nothing is restarted, reconfigured or killed; fixes are printed for you to run.
 - It writes only inside its own folder (`state/`, `LOG/`, `STATE.md`).
-- The one command that changes your system is `rwp heartbeat install`, which you run yourself: a LaunchAgent that pings an outside monitor every 5 minutes.
+- Two commands change your system, and you run both yourself: `rwp heartbeat install` (a LaunchAgent that pings an outside monitor every 5 minutes) and `rwp restart` (a planned restart that skips the FileVault unlock screen once, after you confirm).
 - Optional `AUTO_PUSH=1` commits `STATE.md` and the trip log to your own private repo on depart and return, so the current trip is readable from any browser.
 
 ## Requirements

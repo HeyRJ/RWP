@@ -10,8 +10,10 @@
 #   rwp notify "message"                   push to the phone (ntfy, if configured)
 #   rwp return                             back home: re-check, checklist, STATE -> HOME
 #   rwp heartbeat install URL [--dry-run] | test | remove    outside dead-man's switch (SETUP S8)
-# Checks are read-only. The only commands that change the system are 'heartbeat install/remove',
-# and you run those yourself. Writes inside this repo: state/, LOG/, STATE.md. bash 3.2 (macOS stock).
+#   rwp restart [--arm] [--dry-run]        planned restart: skips the FileVault unlock screen, stops at the login window
+#   rwp unlock                             on the laptop: get the home Mac past the unlock screen (SSH, macOS 26+)
+# Checks are read-only. The commands that change the system are 'heartbeat install/remove' and
+# 'restart': you run those yourself. Writes inside this repo: state/, LOG/, STATE.md. bash 3.2.
 
 set -u
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
@@ -29,8 +31,9 @@ fi
 : "${SERVER_LABEL:=the home Mac}" "${LAPTOP_LABEL:=the laptop}" "${CONTROL_CHAT:=Home Mac control}"
 : "${RWP_REMOTE_DIR:=Projects/RWP}" "${AUTO_PUSH:=0}" "${HEARTBEAT_LABEL:=local.rwp.heartbeat}" "${HEARTBEAT_EVERY:=300}"
 : "${CARRY_NODES:=}" "${REQUIRED_VOLUMES:=}" "${SERVER_LAN_IP:=}" "${NTFY_URL:=}" "${NTFY_TOPIC:=rwp}"
-: "${LAN_FOOTHOLD:=}" "${PREBOOT_TESTED:=}" "${PROJECTS_DIR:=$HOME/Projects}"
+: "${PREBOOT_TESTED:=}" "${PROJECTS_DIR:=$HOME/Projects}"
 : "${MIN_FREE_GB:=50}" "${STALE_DAYS:=14}" "${ACTIVE_DAYS:=14}" "${JOB_MIN_SECS:=1800}" "${HANDOFF_MAX_HOURS:=24}"
+SERVER_UC="$(printf '%s' "$SERVER_LABEL" | awk '{print toupper(substr($0, 1, 1)) substr($0, 2)}')"   # for the start of a sentence
 STATE_DIR="$RWP_HOME/state"
 mkdir -p "$STATE_DIR" "$RWP_HOME/LOG"
 NOW="$(date '+%Y-%m-%d %H:%M %Z')"
@@ -65,7 +68,7 @@ on_server_or_ssh() {  # re-run this command on the home Mac when called from the
 NPASS=0; NWARN=0; NFAIL=0; FAILS=""; ACCEPTED=""
 ACCEPT_IDS=""; ACCEPT_TEXT=""
 QUIET=0; OUT=/dev/null; MODE_ACTIVATE=0
-BACK_DATE=""; LEAVE=""; DEVICES=""; FV=unknown; CUR_LAN_IP=""
+BACK_DATE=""; LEAVE=""; DEVICES=""; FV=unknown; CUR_LAN_IP=""; FOOTHOLD_ROUTE=""
 
 say()    { printf '%s\n' "$*" >> "$OUT"
            if [ "$QUIET" = 0 ]; then printf '%s\n' "$*"
@@ -110,9 +113,9 @@ chk_tailscale() {
     fail H1 "tailscale status failed (not running, or logged out)" "open -a Tailscale"; return
   fi
   if [ -z "$PY" ]; then warn H1 "no python3 to read tailscale status" "brew install python"; return; fi
-  "$PY" - "$js" "$BACK_DATE" "$STALE_DAYS" "$CARRY_NODES" "$SERVER_LABEL" > "$res" 2>&1 <<'PY'
-import json, re, sys, datetime as dt
-js, back, stale, carry, label = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4].split(), sys.argv[5]
+  "$PY" - "$js" "$BACK_DATE" "$STALE_DAYS" "$CARRY_NODES" "$SERVER_LABEL" "$SERVER_LAN_IP" > "$res" 2>&1 <<'PY'
+import ipaddress, json, re, sys, datetime as dt
+js, back, stale, carry, label, lan = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4].split(), sys.argv[5], sys.argv[6]
 d = json.load(open(js))
 now = dt.datetime.now(dt.timezone.utc)
 def t(s):
@@ -165,13 +168,32 @@ for p in (d.get("Peer") or {}).values():
         out("WARN", "T2", f"{name} ({os_}): key expired {ke:%Y-%m-%d} - still yours? needed?", "remove it: Tailscale admin console > Machines")
     elif not online and ls and (now - ls).days >= stale:
         out("WARN", "T2", f"{name} ({os_}): offline {(now - ls).days} days, key still valid", "remove nodes you no longer use: admin console > Machines")
+if lan:   # a foothold: a peer that routes to this Mac's LAN address (exit-node routes /0 don't count)
+    try:
+        lan_ip = ipaddress.ip_address(lan)
+        for p in (d.get("Peer") or {}).values():
+            for cidr in (p.get("PrimaryRoutes") or []) + [a for a in (p.get("AllowedIPs") or []) if not a.startswith(("100.", "fd7a:"))]:
+                try:
+                    net = ipaddress.ip_network(cidr, strict=False)
+                    if net.prefixlen > 0 and lan_ip in net:
+                        out("ROUTE", (p.get("DNSName") or p.get("HostName") or "?").split(".")[0], cidr, "")
+                        raise StopIteration
+                except ValueError:
+                    pass
+    except StopIteration:
+        pass
+    except ValueError:
+        pass
 for c in carry:
     if c not in seen:
         out("FAIL", "T1", f"{c} (a carry device in config) is not in this tailnet", "log the device in, or fix CARRY_NODES in config/rwp.conf")
 PY
   if [ ! -s "$res" ]; then warn H1 "could not parse tailscale status"; return; fi
   local lvl id msg fx
-  while IFS='|' read -r lvl id msg fx; do emit "$lvl" "$id" "$msg" "$fx"; done < "$res"
+  while IFS='|' read -r lvl id msg fx; do
+    if [ "$lvl" = ROUTE ]; then FOOTHOLD_ROUTE="$id ($msg)"; continue; fi
+    emit "$lvl" "$id" "$msg" "$fx"
+  done < "$res"
 }
 
 chk_ssh_vnc() {
@@ -238,14 +260,46 @@ chk_updates() {
   if [ "$cr" = 1 ]; then info H8b "Security Responses & system files auto-install is ON (these can restart too; your call)"; fi
 }
 
+ts_before_login() {   # does Tailscale run before anyone logs in? (open-source tailscaled: yes; the Mac apps: no)
+  [ -f /Library/LaunchDaemons/homebrew.mxcl.tailscale.plist ] || [ -f /Library/LaunchDaemons/com.tailscale.tailscaled.plist ]
+}
+chk_waysin() {   # W1/W2: after a restart, is there a way back in from outside the house?
+  local sar
+  [ "$FV" = on ] || return 0
+  sar="$(fdesetup supportsauthrestart 2>/dev/null)"
+  if [ "$sar" != true ]; then
+    warn W1 "this Mac can't do an authenticated restart: any restart you trigger stops at the unlock screen" "restart it only when you're home"
+  elif ts_before_login; then
+    pass W1 "'rwp restart' skips the unlock screen and stops at the login window; Tailscale runs before login, so log in there by Screen Sharing over the tailnet"
+  elif [ -n "$FOOTHOLD_ROUTE" ]; then
+    pass W1 "'rwp restart' skips the unlock screen and stops at the login window; log in there by Screen Sharing to $SERVER_LAN_IP through $FOOTHOLD_ROUTE"
+  else
+    warn W1 "'rwp restart' skips the unlock screen but stops at the login window, where the Tailscale Mac app doesn't run: from outside the house you lose $SERVER_LABEL until someone logs in" "runbooks/restart-recovery.md (a foothold at home, or Tailscale that runs before login)"
+  fi
+  if [ -z "$SERVER_LAN_IP" ]; then
+    warn W2 "SERVER_LAN_IP is not set: 'rwp unlock' and the foothold check need this Mac's LAN address" "SETUP section 2, then config/rwp.conf"
+  elif [ -n "$FOOTHOLD_ROUTE" ]; then
+    pass W2 "the unlock screen is reachable from anywhere: $FOOTHOLD_ROUTE routes to $SERVER_LAN_IP ('rwp unlock'; last tested: ${PREBOOT_TESTED:-never})"
+  else
+    warn W2 "after a power cut beyond the UPS, a crash or a plain restart, the unlock screen is reachable only from home Wi-Fi ('rwp unlock'; last tested: ${PREBOOT_TESTED:-never}): nothing on the tailnet routes to $SERVER_LAN_IP" "runbooks/foothold.md"
+  fi
+}
+
+chk_console() {   # L1: nothing of yours runs (apps, LaunchAgents, the Tailscale Mac app) until someone logs in
+  local cu me
+  cu="$(stat -f %Su /dev/console 2>/dev/null)"; me="$(id -un)"
+  if [ "$cu" = "$me" ]; then pass L1 "$me is logged in at the screen"
+  elif [ "$cu" = root ] || [ -z "$cu" ]; then
+    fail L1 "nobody is logged in: $SERVER_LABEL is at the login window, so your apps and LaunchAgents haven't started" "log in by Screen Sharing: open vnc://$SERVER_TS_NAME (from home or through a foothold: vnc://$SERVER_LAN_IP)"
+  else
+    warn L1 "the screen is logged in as $cu, not $me"
+  fi
+}
+
 chk_filevault() {
   local al
   if [ "$FV" = on ]; then
-    if [ -n "$LAN_FOOTHOLD" ]; then
-      info S1 "FileVault ON; pre-boot unlock over SSH via $LAN_FOOTHOLD (last tested: ${PREBOOT_TESTED:-never})"
-    else
-      warn S1 "FileVault ON with no pre-boot way in: a restart that isn't an update (power out longer than the UPS lasts, a crash, a plain restart) stops at the unlock screen, and from outside the house nothing reaches $SERVER_LABEL until someone unlocks it" "SETUP S1. Restarts you trigger yourself: sudo fdesetup authrestart (unlocks FileVault once)"
-    fi
+    return 0   # FileVault ON: the ways back in are checked by W1/W2
   elif [ "$FV" = off ]; then
     al="$(defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null)"
     if [ -n "$al" ]; then info S1 "FileVault OFF; auto-login as $al"
@@ -354,7 +408,8 @@ chk_repos() {
 }
 
 collect_jobs() {   # snapshot of your long-running jobs; the previous snapshot is kept for chk_restart
-  if [ -f "$STATE_DIR/.jobs" ]; then cp -p "$STATE_DIR/.jobs" "$STATE_DIR/.jobs.prev"; fi
+  local f
+  for f in .jobs .jobs_launchd; do if [ -f "$STATE_DIR/$f" ]; then cp -p "$STATE_DIR/$f" "$STATE_DIR/$f.prev"; fi; done
   ps -axo user=,command= 2>/dev/null | awk -v me="$(id -un)" '$1 == me { c = $0; sub(/^ *[^ ]+ +/, "", c); print substr(c, 1, 170) }' > "$STATE_DIR/.procs"
   ps -axo pid=,etime=,user=,command= 2>/dev/null | awk -v me="$(id -un)" -v min="$JOB_MIN_SECS" '
     function secs(e,   d, r, a, n) { d = 0; r = e
@@ -369,12 +424,24 @@ collect_jobs() {   # snapshot of your long-running jobs; the previous snapshot i
       if (cmd ~ /(\/Applications\/|\/System\/|Application Support\/Claude\/|Helper|desktop-commander|MacOS-MCP|macos-mcp|-mcp|mcp-server|uv tool uvx|\.cache\/uv\/archive|claude-code\/bin|ShipIt|bin\/rwp|ssh-agent)/) next
       if (secs($2) < min) next
       printf "%s|%s|%s\n", $1, $2, substr(cmd, 1, 170) }' > "$STATE_DIR/.jobs"
+  # which of them run under one of your launchd jobs (apps don't count): those start again by themselves once
+  # someone is logged in; everything else was started by hand and stays dead after a restart
+  { launchctl print "gui/$UID_N" 2>/dev/null \
+      | awk '/^\tservices = \{/ {s = 1; next} s && /^\t\}/ {s = 0} s && $1 ~ /^[0-9]+$/ && $1 > 0 && $3 !~ /^application\./ {print "L", $1, $3}'
+    ps -axo pid=,ppid= 2>/dev/null | awk '{print "P", $1, $2}'
+    cut -d'|' -f1 "$STATE_DIR/.jobs" | awk '{print "J", $1}'
+  } | awk '$1 == "L" {l[$2] = $3; next} $1 == "P" {pp[$2] = $3; next}
+           $1 == "J" {p = $2; n = 0; while (p > 1 && n < 64) { if (p in l) {print $2, l[p]; break} p = pp[p]; n++ }}' > "$STATE_DIR/.jobs_launchd"
 }
+job_label() { awk -v p="$1" '$1 == p {print $2; exit}' "$2" 2>/dev/null; }   # launchd label for pid $1 in snapshot $2
 chk_jobs() {
-  local n pid et cmd
+  local n pid et cmd lbl
   n="$(wc -l < "$STATE_DIR/.jobs" | tr -d ' ')"
-  info S6 "$n job(s) running longer than $((JOB_MIN_SECS / 60)) min (they keep running; the away sheet lists them)"
-  while IFS='|' read -r pid et cmd; do info S6 "  pid $pid, up $et: $cmd"; done < "$STATE_DIR/.jobs"
+  info S6 "$n job(s) running longer than $((JOB_MIN_SECS / 60)) min (they keep running; the away sheet lists them; [launchd] = starts again by itself after a restart, once someone is logged in)"
+  while IFS='|' read -r pid et cmd; do
+    lbl="$(job_label "$pid" "$STATE_DIR/.jobs_launchd")"
+    info S6 "  pid $pid, up $et${lbl:+ [launchd $lbl]}: $cmd"
+  done < "$STATE_DIR/.jobs"
 }
 
 chk_restart() {   # R1: did this Mac restart since the last check, and which jobs from then are gone?
@@ -384,13 +451,19 @@ chk_restart() {   # R1: did this Mac restart since the last check, and which job
   pt="$(stat -f %m "$prev" 2>/dev/null)"
   if [ -n "$boot" ] && [ -n "$pt" ] && [ "$boot" -gt "$pt" ]; then
     restarted=1
-    warn R1 "RESTARTED at $(date -r "$boot" '+%Y-%m-%d %H:%M') (last check before it: $(date -r "$pt" '+%Y-%m-%d %H:%M')); now on macOS $(sw_vers -productVersion 2>/dev/null)" "what died is listed below; bring back what you need"
+    local planned="" ie
+    ie="$(tail -1 "$STATE_DIR/restart_intent.log" 2>/dev/null | cut -d'|' -f1)"
+    if [ -n "$ie" ] && [ "$ie" -ge "$pt" ] 2>/dev/null && [ "$ie" -le "$boot" ]; then planned=", planned: rwp restart at $(date -r "$ie" '+%H:%M')"; fi
+    warn R1 "RESTARTED at $(date -r "$boot" '+%Y-%m-%d %H:%M') (last check before it: $(date -r "$pt" '+%Y-%m-%d %H:%M')$planned); now on macOS $(sw_vers -productVersion 2>/dev/null)" "what died is listed below; bring back what you need"
   fi
+  local lbl
   while IFS='|' read -r pid et cmd; do
     [ -n "$cmd" ] || continue
     grep -qxF -- "$cmd" "$STATE_DIR/.procs" && continue
     gone=$((gone+1))
-    if [ "$restarted" = 1 ]; then warn R1 "gone since the last check: $cmd" "start it again if you need it; make it a launchd job if it must survive restarts (SETUP S22)"
+    lbl="$(job_label "$pid" "$STATE_DIR/.jobs_launchd.prev")"
+    if [ "$restarted" = 1 ] && [ -n "$lbl" ]; then warn R1 "not running since the restart: $cmd (launchd $lbl)" "it starts by itself once someone is logged in (L1); if someone is: launchctl print gui/$UID_N/$lbl"
+    elif [ "$restarted" = 1 ]; then warn R1 "gone since the last check: $cmd" "started by hand, so it stays gone: start it again if you need it; make it a launchd job if it must survive restarts (SETUP S22)"
     else info R1 "finished or stopped since the last check: $cmd"; fi
   done < "$prev"
   if [ "$restarted" = 0 ] && [ "$gone" = 0 ]; then pass R1 "no restart since the last check ($(date -r "$pt" '+%Y-%m-%d %H:%M')); its long-running jobs are all still there"; fi
@@ -423,9 +496,9 @@ chk_money() {
 
 run_checks() {   # $1 = full (departure/preflight) | health (status while away, return)
   say "RWP checks on $(scutil --get ComputerName 2>/dev/null) - macOS $(sw_vers -productVersion 2>/dev/null) - up $(uptime | sed -E 's/.*up +(.*), [0-9]+ users?.*/\1/') - $NOW"
-  collect_jobs; chk_restart
+  collect_jobs; chk_restart; chk_console
   chk_tailscale; chk_ssh_vnc; chk_power; chk_claude; chk_disk
-  chk_updates; chk_filevault; chk_network; chk_services; chk_heartbeat
+  chk_updates; chk_filevault; chk_waysin; chk_network; chk_services; chk_heartbeat
   if [ "${1:-full}" = full ]; then chk_handoff; chk_repos; chk_jobs; fi
   chk_money
 }
@@ -648,7 +721,10 @@ cmd_status() {
       scp -q $SSH_OPTS "$SERVER_SSH:$RWP_REMOTE_DIR/state/AWAY_SHEET.md" "$STATE_DIR/server_AWAY_SHEET.md" 2>/dev/null
       return 0
     fi
-    echo "$SERVER_LABEL did not answer over SSH ($SERVER_SSH)."
+    echo "$SERVER_UC did not answer over SSH ($SERVER_SSH)."
+    if [ -n "$SERVER_LAN_IP" ] && nc -z -G 5 "$SERVER_LAN_IP" 22 >/dev/null 2>&1; then
+      echo "But $SERVER_LAN_IP:22 answers: it's at the unlock screen or the login window. Next: rwp unlock"
+    fi
     if [ -n "$TS_BIN" ]; then "$TS_BIN" status 2>/dev/null | grep -i "$SERVER_TS_NAME" | sed 's/^/tailscale: /'; fi
     echo "Last cached status ($(stat -f '%Sm' "$cache" 2>/dev/null || echo 'none cached')):"
     cat "$cache" 2>/dev/null
@@ -668,6 +744,97 @@ cmd_status() {
     run_checks full
   fi
   summary
+}
+
+cmd_restart() {   # planned restart that skips the FileVault screen. YOU run it; your assistant never does (CLAUDE_RULES).
+  local a arm=0 dry=0 sar way ans want
+  if [ "$(role)" != server ]; then
+    echo "rwp: running 'restart' on $SERVER_LABEL over SSH (sudo asks for your password there, then fdesetup asks for your user name and password)." >&2
+    # shellcheck disable=SC2029,SC2086,SC2088
+    exec ssh -t $SSH_OPTS "$SERVER_SSH" "~/$RWP_REMOTE_DIR/bin/rwp restart $(printf '%q ' "$@")"
+  fi
+  for a in "$@"; do case "$a" in --arm) arm=1;; --dry-run) dry=1;; *) echo "usage: rwp restart [--arm] [--dry-run]" >&2; exit 2;; esac; done
+  OUT="$STATE_DIR/restart_$STAMP.txt"; : > "$OUT"; QUIET=1
+  chk_updates >/dev/null; chk_tailscale >/dev/null 2>&1; collect_jobs; QUIET=0
+  if [ "$FV" != on ]; then
+    loud "FileVault is off: a plain restart comes back by itself. Run: sudo shutdown -r now"; return 0
+  fi
+  sar="$(fdesetup supportsauthrestart 2>/dev/null)"
+  if [ "$sar" != true ]; then loud "This Mac can't do an authenticated restart: a restart now stops at the unlock screen. Not restarting."; return 1; fi
+  if ts_before_login; then way="Tailscale runs before login: Screen Sharing to vnc://$SERVER_TS_NAME over the tailnet, log in."
+  elif [ -n "$FOOTHOLD_ROUTE" ]; then way="Screen Sharing to vnc://$SERVER_LAN_IP through $FOOTHOLD_ROUTE, log in."
+  else way="NONE from outside the house. The Tailscale app waits for a login, so only someone on home Wi-Fi can log it in (Screen Sharing to vnc://$SERVER_LAN_IP)."; fi
+  loud "rwp restart: sudo fdesetup authrestart on $SERVER_LABEL. It skips the FileVault unlock screen once and stops at the login window: nothing of yours runs until someone logs in."
+  if [ "$arm" = 1 ]; then loud "--arm: nothing restarts now. The next restart you trigger any other way (Apple menu, an installer) skips the unlock screen once; don't count on it for a crash or a power cut. Until then FileVault protection is reduced: whoever restarts it next skips the unlock screen."; fi
+  loud "Way back in to the login window afterwards: $way"
+  loud "Jobs that stop and stay stopped (started by hand, running longer than $((JOB_MIN_SECS / 60)) min):"
+  local pid et cmd n=0 lj
+  while IFS='|' read -r pid et cmd; do
+    [ -n "$(job_label "$pid" "$STATE_DIR/.jobs_launchd")" ] && continue
+    loud "  - $cmd"; n=$((n+1))
+  done < "$STATE_DIR/.jobs"
+  if [ "$n" = 0 ]; then loud "  (none)"; fi
+  lj="$(awk '{print $2}' "$STATE_DIR/.jobs_launchd" 2>/dev/null | sort -u | tr '\n' ' ')"
+  if [ -n "$lj" ]; then loud "launchd jobs that start again by themselves once someone is logged in: ${lj% }"; fi
+  want=yes; if ! ts_before_login && [ -z "$FOOTHOLD_ROUTE" ]; then want=RESTART; fi
+  if [ "$dry" = 1 ]; then loud "DRY RUN: stopping here. Nothing was restarted or armed."; return 0; fi
+  printf 'Type %s to go ahead: ' "$want"; read -r ans || ans=""
+  if [ "$ans" != "$want" ]; then loud "Not restarted."; return 1; fi
+  printf '%s|%s|authrestart|arm=%s\n' "$(date +%s)" "$NOW" "$arm" >> "$STATE_DIR/restart_intent.log"
+  if [ "$arm" = 1 ]; then sudo fdesetup authrestart -delayminutes -1 && loud "Armed."
+  else loud "Restarting. Afterwards: log in (above), then rwp status. If it doesn't come back: runbooks/restart-recovery.md"; sudo fdesetup authrestart; fi
+}
+
+ts_pong() {   # any pong counts, relayed (DERP) or direct: --until-direct would call a relayed path a failure
+  [ -n "$TS_BIN" ] && "$TS_BIN" ping --c 1 --timeout 5s "$SERVER_TS_NAME" 2>/dev/null | grep -q 'pong from'
+}
+lan_console() {   # over the LAN with your key: the normal sshd takes it, the FileVault unlock screen takes passwords only
+  # shellcheck disable=SC2029,SC2086
+  ssh $SSH_OPTS -o HostKeyAlias="$SERVER_TS_NAME" "$SERVER_USER@$SERVER_LAN_IP" 'stat -f %Su /dev/console' 2>/dev/null
+}
+past_unlock() {   # $1 = who's at the console
+  if [ "$1" = root ]; then
+    echo "$SERVER_UC is past the unlock screen, at the login window: nobody is logged in, so the Tailscale app and everything else of yours waits."
+    echo "Log in by Screen Sharing:  open vnc://$SERVER_LAN_IP    then: rwp status"
+  else
+    echo "$SERVER_UC is unlocked and $1 is logged in, but it isn't on the tailnet (the Tailscale app quit or logged out)."
+    echo "Try:  ssh $SERVER_USER@$SERVER_LAN_IP open -a Tailscale    or look by Screen Sharing: open vnc://$SERVER_LAN_IP"
+  fi
+}
+cmd_unlock() {   # on the laptop: get the home Mac from the FileVault unlock screen back onto the tailnet (macOS 26+)
+  local i cu
+  if [ "$(role)" = server ]; then echo "rwp unlock runs on $LAPTOP_LABEL" >&2; exit 2; fi
+  [ -n "$SERVER_LAN_IP" ] || { echo "rwp: set SERVER_LAN_IP in config/rwp.conf" >&2; exit 2; }
+  # shellcheck disable=SC2086
+  if ts_pong && ssh $SSH_OPTS "$SERVER_SSH" true 2>/dev/null; then
+    echo "$SERVER_UC is up and on the tailnet: nothing to unlock. (rwp status)"; return 0
+  fi
+  if ! nc -z -G 5 "$SERVER_LAN_IP" 22 >/dev/null 2>&1; then
+    echo "Can't reach $SERVER_LAN_IP:22. Either you're away and nothing on the tailnet routes to it (runbooks/foothold.md), or $SERVER_LABEL is off or off the network (the unreachable runbook)."
+    return 1
+  fi
+  cu="$(lan_console)"
+  if [ -n "$cu" ]; then past_unlock "$cu"; return 1; fi
+  echo "$SERVER_UC answers at $SERVER_LAN_IP but won't take your key: that's the FileVault unlock screen."
+  echo "Log in as $SERVER_USER with your macOS password. The connection closes when it unlocks."
+  echo "(A normal shell prompt instead means it was already unlocked: type exit, then open vnc://$SERVER_LAN_IP)"
+  ssh -o UserKnownHostsFile="$STATE_DIR/known_hosts_preboot" -o StrictHostKeyChecking=accept-new \
+      -o PubkeyAuthentication=no -o PreferredAuthentications=keyboard-interactive,password \
+      -o ConnectTimeout=10 "$SERVER_USER@$SERVER_LAN_IP" || true
+  echo "Waiting up to 4 minutes for $SERVER_LABEL to come back on the tailnet ..."
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24; do
+    sleep 10
+    if ts_pong; then echo "Back on the tailnet after about $((i * 10)) s."; cmd_status; return $?; fi
+  done
+  cu="$(lan_console)"
+  if [ -n "$cu" ]; then past_unlock "$cu"
+  elif nc -z -G 5 "$SERVER_LAN_IP" 22 >/dev/null 2>&1; then
+    echo "Still at the unlock screen (wrong password?): run rwp unlock again."
+    echo "If ssh refused a changed host key: the unlock screen's key can change (after a macOS update, say). Only if you're sure $SERVER_LAN_IP is your Mac: rm $STATE_DIR/known_hosts_preboot"
+  else
+    echo "No answer from $SERVER_LAN_IP: it may still be booting. Run rwp unlock again in a minute; if it stays silent, the unreachable runbook."
+  fi
+  return 1
 }
 
 cmd_notify() {
@@ -769,6 +936,8 @@ case "${1:-help}" in
   notify)    shift; cmd_notify "$@";;
   return)    shift; cmd_return "$@";;
   heartbeat) shift; cmd_heartbeat "$@";;
-  help|-h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//';;
+  restart)   shift; cmd_restart "$@";;
+  unlock)    shift; cmd_unlock "$@";;
+  help|-h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//';;
   *) echo "rwp: unknown command '$1' (rwp help)" >&2; exit 2;;
 esac
