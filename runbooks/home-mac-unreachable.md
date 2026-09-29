@@ -1,4 +1,18 @@
-# Runbook: the home Mac doesn't answer
+# Runbook: the home Mac doesn't answer, or it restarted
+
+## 0. It restarted and came back
+Run `rwp status`. Check R1 says when it restarted and lists every long-running job from the last check that is now gone. Nothing on disk is lost; what's lost is whatever was running (and anything under /private/tmp, which macOS clears at boot).
+- Bring back what you need, over SSH, in tmux, with each project's own start commands.
+- Claude Code sessions that were running in tmux resume with `cd ~/Projects/<project> && claude --continue` (the transcripts survive in `~/.claude/projects/`).
+- Log it in the trip log: when, why (`softwareupdate --history` shows an update), what you restarted.
+
+Which restarts come back on their own (FileVault ON):
+
+| Restart | Comes back to |
+|---|---|
+| macOS update | logged in, by itself |
+| `sudo fdesetup authrestart` (the way to restart it remotely) | unlocked once; desktop or login window: SETUP E3a |
+| power out longer than the UPS lasts, a crash, a plain restart | the unlock screen → section 2, step 4 |
 
 ## 1. Which paths are down?
 

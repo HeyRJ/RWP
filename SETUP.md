@@ -5,15 +5,24 @@ One-time work, in the order to do it. `INIT.md` fills the status table from your
 
 ## First-time walkthrough (about 1.5 h; nothing here restarts anything)
 
-### 1. Stop the restarts (15 min) — S1, check H8
-The usual chain: FileVault ON + automatic macOS updates ON + a power cut. Any restart parks the Mac at the unlock screen; no Tailscale, Claude or SSH until someone types the password at the keyboard.
-- **Automatic installs off, permanently** (a server shouldn't restart itself): System Settings → General → Software Update → ⓘ next to Automatic Updates → **Install macOS updates: off**; for zero surprise restarts also **Install Security Responses and system files: off**. Keep "Download new updates" on. Terminal equivalent:
+### 1. Restarts (15 min) — S1, checks H8 / S1 / R1
+What a restart does to a Mac with FileVault ON:
+
+| Restart | Comes back to |
+|---|---|
+| macOS update | **logged in, on its own**: macOS stashes your login before it reboots (seen on a Mac mini on macOS 27) |
+| one you trigger with `sudo fdesetup authrestart` | FileVault unlocked once, no password; check whether it lands on the desktop or the login window (E3a) |
+| power out longer than the UPS lasts, a crash, a plain `shutdown -r` | **the FileVault unlock screen**: no Tailscale, no assistant, no SSH from outside the house |
+
+Every kind kills the jobs you started by hand; only launchd jobs come back (S22). `rwp status` lists what died (R1).
+- **Automatic installs off** (not a lockout, but they kill running work at a time you didn't choose): System Settings → General → Software Update → ⓘ next to Automatic Updates → **Install macOS updates: off**; for zero surprise restarts also **Install Security Responses and system files: off**. Keep "Download new updates" on. Terminal equivalent:
   ```
   sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates -bool false
   sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate CriticalUpdateInstall -bool false   # optional
   ```
-  Then update by hand when you're home, when you can unlock it at the keyboard.
-- **Power:** the Mac, the router **and** the modem all need backup power (UPS or house inverter). A Mac that stays up behind a dead router is just as unreachable. A small DC mini-UPS covers a router and modem cheaply. If your inverter has a UPS / Normal (Eco) switch, UPS mode changes over faster: it's the setting meant for computers. E4 proves it.
+  Then update by hand when you're home.
+- **Power:** the Mac, the router **and** the modem all need backup power (UPS or house inverter). A Mac that stays up behind a dead router is just as unreachable. A small DC mini-UPS covers a router and modem cheaply. If your inverter has a UPS / Normal (Eco) switch, UPS mode changes over faster: it's the setting meant for computers. Know how long the UPS lasts, and plug its USB cable into the Mac if it has one, so macOS can shut down cleanly before the battery runs out. E4 proves it.
+- **Restarts you trigger remotely:** always `sudo fdesetup authrestart` (check `fdesetup supportsauthrestart` says true), never a plain restart.
 - Check: `bin/rwp preflight` → **H8 PASS**.
 
 ### 2. Stop the address moving (10 min) — S6
@@ -53,17 +62,20 @@ If your alerts come from the home Mac, a dead Mac is silent, and silence reads a
 
 ## Checks only you can do
 
-Do E1 and E2 any time. **E3 and E4 stop every running job on the home Mac**: only when nothing is running that you care about.
+Do E1, E2 and E4 any time. **E3 stops every running job on the home Mac**: only when nothing is running that you care about.
 
 - **E1 Hotspot handoff (5 min)** — S16, H9. Laptop on your phone's hotspot (home Wi-Fi off), Tailscale on: `~/Projects/RWP/bin/rwp handoff`. Expect "reached … via DERP(…)" or a public IP, SSH ok, Screen Sharing ok, "Receipt left … (ok=yes, lan=no)". Then open `vnc://<home-mac>` and log in once.
 - **E2 Phone on mobile data (10 min)** — S5, S17. Create the pinned conversation from the home Mac's Claude app (so it's linked to that Mac). Then, phone Wi-Fi off, Tailscale on: SSH app → `rwp status`; ntfy (if you use it) → `rwp notify "test"` arrives; the pinned conversation → ask it to run `date` on the home Mac.
-- **E3 Reboot test (10–15 min)** — S11. `sudo shutdown -r now`. At the FileVault screen, on macOS 26 or later with Apple Silicon, unlock **over SSH from the laptop on home Wi-Fi**: `ssh <user>@<home-mac LAN IP>`, your password; the connection drops while it finishes, wait a minute. Then confirm what came back on its own (Tailscale, the Claude app, your services, the heartbeat) and note anything started by hand that didn't. Set `PREBOOT_TESTED`.
-- **E4 Power-cut test (5 min)** — S1. Note `uptime`, cut the mains to your UPS/inverter for 2 minutes, restore it. `uptime` shouldn't reset, the router should stay online, and the phone on mobile data should still reach the Mac.
+- **E3 Restart paths (10–15 min each)** — S11. For each, note whether the Mac comes back to **the desktop** (everything starts) or **the login window** (the Tailscale app, the Claude app and your launchd jobs wait for a login), and how long it takes. Then `rwp status`: R1 lists what died.
+  - **E3a** `sudo fdesetup authrestart`: the way to restart remotely.
+  - **E3b** `sudo shutdown -r now`, then at the unlock screen (macOS 26 or later, Apple Silicon) unlock **over SSH from the laptop on home Wi-Fi**: `ssh <user>@<home-mac LAN IP>`, your password; the connection drops while it finishes, wait a minute. If it stops at the login window, log in through Screen Sharing from the laptop (same Wi-Fi). Set `PREBOOT_TESTED`.
+- **E4 UPS check (5 min)** — S1. Note `uptime`, cut the mains for 2 minutes, restore it. `uptime` shouldn't reset, and the phone on mobile data should still reach the Mac (proving the router and modem stayed up too).
 - **E5 Depart dry run (5 min).** `rwp depart --leave "test" --back <date>` without `--activate`; read `state/AWAY_SHEET.md`.
 
 ## Later (needs a purchase)
 - **LAN foothold for pre-boot unlock from anywhere:** a Raspberry Pi (or any always-on Linux box) on backup power, running Tailscale as a subnet router for **only the home Mac's address** (`tailscale up --advertise-routes=<LAN IP>/32`, IP forwarding on, route approved in the admin console, "Use Tailscale subnets" on the laptop and phone). Then `ssh <user>@<LAN IP>` unlocks FileVault from the hotel. Set `LAN_FOOTHOLD`.
 - **A hardware security key** (above).
+- **Tailscale that runs before login** (if E3 shows restarts stopping at the login window): swap the Tailscale Mac app for the open-source `tailscaled` (Homebrew, runs as a system daemon). The Mac is back on the tailnet as soon as the disk is unlocked, before anyone logs in, and Tailscale's browser SSH console works from any device. Do it at home: it replaces the thing you reach the Mac through.
 
 ## Status
 
@@ -79,7 +91,7 @@ Do E1 and E2 any time. **E3 and E4 stop every running job on the home Mac**: onl
 | S8 | Outside heartbeat | ❓ |
 | S9 | Which services must stay up while away (`config/services.tsv`) | ❓ |
 | S10 | Home contact walked through `runbooks/home-contact.md` | ❓ |
-| S11 | Reboot test (E3) | ❓ |
+| S11 | Restart paths: update, authrestart (E3a), plain restart + SSH unlock (E3b) | ❓ |
 | S12 | `hostname` matches LocalHostName (cosmetic) | ❓ |
 | S13 | Laptop FileVault + Find My | ❓ |
 | S14 | Laptop `~/.ssh/config` alias | ❓ |
@@ -90,3 +102,4 @@ Do E1 and E2 any time. **E3 and E4 stop every running job on the home Mac**: onl
 | S19 | A work laptop is never a fallback for personal infrastructure | rule |
 | S20 | This repo is private | ❓ |
 | S21 | One line in your assistant's global preferences: *"If ~/Projects/RWP/STATE.md says AWAY, follow the AWAY rules in ~/Projects/RWP/CLAUDE_RULES.md."* | ❓ |
+| S22 | Jobs that must survive a restart run under launchd (a LaunchAgent with RunAtLoad/KeepAlive and a log file). Claude Code sessions resume with `claude --continue` in their project folder | ❓ |

@@ -15,6 +15,7 @@ Order matters. Everything that needs your hands happens first. Background jobs m
 
 | ID | Check | Blocks ACTIVE? | Fix |
 |---|---|---|---|
+| R1 | Did the home Mac restart since the last check, and which long-running jobs from then are gone? | no | bring back what you need; launchd for what must survive (SETUP S22) |
 | H1 | Tailscale running on the home Mac, online, its key expiry disabled | yes | `open -a Tailscale`; admin console → disable key expiry |
 | T1 | Your carry devices' Tailscale keys valid past your return date | yes | re-authenticate that device now |
 | T2 | No stale nodes or expired keys in the tailnet | no | remove them in the admin console |
@@ -25,7 +26,7 @@ Order matters. Everything that needs your hands happens first. Background jobs m
 | H5 | Claude desktop app running (the Claude link to the home Mac) | yes | `open -a Claude` |
 | H6 | SSD free space above the floor; required volumes mounted | yes | move finished outputs to an external drive |
 | H7 | Registered services up (`config/services.tsv`) | only `required=yes` | the restart hint in the registry (you run it) |
-| H8 | Automatic macOS updates OFF while FileVault is ON | yes | Software Update → Automatic Updates → Install macOS updates OFF |
+| H8 | Automatic macOS updates OFF (an update restart logs back in by itself, but kills every job started by hand) | no | Software Update → Automatic Updates → Install macOS updates OFF |
 | H9 | Handoff receipt: from the laptop, off the home network, < 24 h old | yes, at activation | on the laptop, on a phone hotspot: `bin/rwp handoff` |
 | S1 | FileVault ON has a pre-boot way in | no, but see §4 | `SETUP.md` 1 and Later |
 | S2/S3 | Wired network; LAN IP matches config | no | `SETUP.md` 2 |
@@ -44,7 +45,7 @@ Order matters. Everything that needs your hands happens first. Background jobs m
 7. **Phone, on mobile data**: Tailscale on → open the pinned Claude conversation → ask for `rwp status`; then `rwp notify "test"` and see the push arrive.
 
 ### 1d. Activate
-`bin/rwp depart --leave "<when>" --back <date> --devices "<list>" --activate [--accept "H8: reason"]…`
+`bin/rwp depart --leave "<when>" --back <date> --devices "<list>" --activate [--accept "H6v: reason"]…`
 
 - No unaccepted hard failure → **ACTIVE**, or **ACTIVE with accepted risks** (each accepted ID and its reason goes into STATE, the away sheet and the trip log).
 - Any unaccepted hard failure → **NOT ACTIVE**. Nothing changes; fix and rerun.
@@ -66,6 +67,7 @@ Order matters. Everything that needs your hands happens first. Background jobs m
 6. STATE → HOME (the script does this).
 
 ## 4. What ACTIVE does not cover (until SETUP closes them)
-- **A restart while FileVault is ON**, until you have a pre-boot way in (SETUP Later). The Mac waits at the unlock screen; Tailscale, Claude, SSH and every service stay down until someone unlocks it.
+- **A restart that isn't an update, while FileVault is ON**: power out longer than the UPS lasts, a crash, a plain restart. The Mac waits at the unlock screen; Tailscale, Claude, SSH and every service stay down until someone unlocks it (at the keyboard, or over SSH from the home network; SETUP Later for from anywhere). Update restarts log back in by themselves. Restarts you trigger remotely: `sudo fdesetup authrestart`.
+- **Jobs started by hand.** Any restart kills them; only launchd jobs come back. `rwp status` lists what died (R1).
 - **A dead Mac nobody notices**, until the outside heartbeat exists (SETUP 4).
 - **Anything that doesn't live on the home Mac**, like production on a cloud platform: give it its own break-glass line in `runbooks/borrowed-device.md`.

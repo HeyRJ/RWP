@@ -232,11 +232,7 @@ chk_updates() {
   au="$(defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates 2>/dev/null)"
   cr="$(defaults read /Library/Preferences/com.apple.SoftwareUpdate CriticalUpdateInstall 2>/dev/null)"
   if [ "$au" = 1 ]; then
-    if [ "$FV" = on ]; then
-      fail H8 "automatic macOS updates ON while FileVault is ON: an overnight update restart parks $SERVER_LABEL at the unlock screen, out of reach" "System Settings > General > Software Update > Automatic Updates (i) > Install macOS updates OFF  (or: sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates -bool false)"
-    else
-      warn H8 "automatic macOS updates ON: a restart while away kills every job not managed by launchd" "turn it off, update by hand when you're home"
-    fi
+    warn H8 "automatic macOS updates ON: an update restart logs back in by itself (macOS stashes your login first), but it kills every job you started by hand" "System Settings > General > Software Update > Automatic Updates (i) > Install macOS updates OFF (or: sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates -bool false); update by hand when you're home"
   elif [ "$au" = 0 ]; then pass H8 "automatic macOS update install is OFF"
   else warn H8 "could not read the automatic-update setting" "check System Settings > General > Software Update"; fi
   if [ "$cr" = 1 ]; then info H8b "Security Responses & system files auto-install is ON (these can restart too; your call)"; fi
@@ -248,7 +244,7 @@ chk_filevault() {
     if [ -n "$LAN_FOOTHOLD" ]; then
       info S1 "FileVault ON; pre-boot unlock over SSH via $LAN_FOOTHOLD (last tested: ${PREBOOT_TESTED:-never})"
     else
-      warn S1 "FileVault ON with no pre-boot path: after ANY restart (power cut, update, crash) $SERVER_LABEL waits at the unlock screen, and nothing remote reaches it until someone unlocks it at home" "SETUP S1"
+      warn S1 "FileVault ON with no pre-boot way in: a restart that isn't an update (power out longer than the UPS lasts, a crash, a plain restart) stops at the unlock screen, and from outside the house nothing reaches $SERVER_LABEL until someone unlocks it" "SETUP S1. Restarts you trigger yourself: sudo fdesetup authrestart (unlocks FileVault once)"
     fi
   elif [ "$FV" = off ]; then
     al="$(defaults read /Library/Preferences/com.apple.loginwindow autoLoginUser 2>/dev/null)"
@@ -357,8 +353,9 @@ chk_repos() {
   done
 }
 
-chk_jobs() {
-  local n pid et cmd
+collect_jobs() {   # snapshot of your long-running jobs; the previous snapshot is kept for chk_restart
+  if [ -f "$STATE_DIR/.jobs" ]; then cp -p "$STATE_DIR/.jobs" "$STATE_DIR/.jobs.prev"; fi
+  ps -axo user=,command= 2>/dev/null | awk -v me="$(id -un)" '$1 == me { c = $0; sub(/^ *[^ ]+ +/, "", c); print substr(c, 1, 170) }' > "$STATE_DIR/.procs"
   ps -axo pid=,etime=,user=,command= 2>/dev/null | awk -v me="$(id -un)" -v min="$JOB_MIN_SECS" '
     function secs(e,   d, r, a, n) { d = 0; r = e
       if (index(e, "-")) { split(e, a, "-"); d = a[1]; r = a[2] }
@@ -372,9 +369,31 @@ chk_jobs() {
       if (cmd ~ /(\/Applications\/|\/System\/|Application Support\/Claude\/|Helper|desktop-commander|MacOS-MCP|macos-mcp|-mcp|mcp-server|uv tool uvx|\.cache\/uv\/archive|claude-code\/bin|ShipIt|bin\/rwp|ssh-agent)/) next
       if (secs($2) < min) next
       printf "%s|%s|%s\n", $1, $2, substr(cmd, 1, 170) }' > "$STATE_DIR/.jobs"
+}
+chk_jobs() {
+  local n pid et cmd
   n="$(wc -l < "$STATE_DIR/.jobs" | tr -d ' ')"
   info S6 "$n job(s) running longer than $((JOB_MIN_SECS / 60)) min (they keep running; the away sheet lists them)"
   while IFS='|' read -r pid et cmd; do info S6 "  pid $pid, up $et: $cmd"; done < "$STATE_DIR/.jobs"
+}
+
+chk_restart() {   # R1: did this Mac restart since the last check, and which jobs from then are gone?
+  local prev="$STATE_DIR/.jobs.prev" boot pt pid et cmd gone=0 restarted=0
+  [ -f "$prev" ] || return 0
+  boot="$(sysctl -n kern.boottime 2>/dev/null | sed -E 's/^\{ sec = ([0-9]+),.*/\1/')"   # anchored: "usec = " also matches "sec = "
+  pt="$(stat -f %m "$prev" 2>/dev/null)"
+  if [ -n "$boot" ] && [ -n "$pt" ] && [ "$boot" -gt "$pt" ]; then
+    restarted=1
+    warn R1 "RESTARTED at $(date -r "$boot" '+%Y-%m-%d %H:%M') (last check before it: $(date -r "$pt" '+%Y-%m-%d %H:%M')); now on macOS $(sw_vers -productVersion 2>/dev/null)" "what died is listed below; bring back what you need"
+  fi
+  while IFS='|' read -r pid et cmd; do
+    [ -n "$cmd" ] || continue
+    grep -qxF -- "$cmd" "$STATE_DIR/.procs" && continue
+    gone=$((gone+1))
+    if [ "$restarted" = 1 ]; then warn R1 "gone since the last check: $cmd" "start it again if you need it; make it a launchd job if it must survive restarts (SETUP S22)"
+    else info R1 "finished or stopped since the last check: $cmd"; fi
+  done < "$prev"
+  if [ "$restarted" = 0 ] && [ "$gone" = 0 ]; then pass R1 "no restart since the last check ($(date -r "$pt" '+%Y-%m-%d %H:%M')); its long-running jobs are all still there"; fi
 }
 
 is_public() {
@@ -403,7 +422,8 @@ chk_money() {
 }
 
 run_checks() {   # $1 = full (departure/preflight) | health (status while away, return)
-  say "RWP checks on $(scutil --get ComputerName 2>/dev/null) - macOS $(sw_vers -productVersion 2>/dev/null) - up $(uptime | sed -E 's/.*up (.*), [0-9]+ users?.*/\1/') - $NOW"
+  say "RWP checks on $(scutil --get ComputerName 2>/dev/null) - macOS $(sw_vers -productVersion 2>/dev/null) - up $(uptime | sed -E 's/.*up +(.*), [0-9]+ users?.*/\1/') - $NOW"
+  collect_jobs; chk_restart
   chk_tailscale; chk_ssh_vnc; chk_power; chk_claude; chk_disk
   chk_updates; chk_filevault; chk_network; chk_services; chk_heartbeat
   if [ "${1:-full}" = full ]; then chk_handoff; chk_repos; chk_jobs; fi

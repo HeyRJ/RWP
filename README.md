@@ -8,7 +8,7 @@ It's a handful of markdown files and one read-only bash script, made to be run w
 
 Remote access that works on your home Wi-Fi tells you nothing about the hotel. What strands people is boring and predictable:
 
-- **A restart while you're away.** FileVault on, automatic macOS updates on, one power cut: the Mac sits at the unlock screen. No Tailscale, no SSH, no Screen Sharing until someone types the password at the keyboard.
+- **A restart while you're away.** With FileVault on, a power cut longer than your UPS lasts, a crash or a plain restart leaves the Mac at the unlock screen: no Tailscale, no SSH, no Screen Sharing until someone types the password. (A macOS update restart logs back in by itself, but kills everything you started by hand.)
 - **Testing from home.** On your own network the local path hides a broken remote path. It works right up until you leave.
 - **One way in.** Only the laptop's SSH key can log in. Lose the laptop and you're locked out of your own machine.
 - **Silence.** Your alerts come from the machine that just died, so a dead Mac looks exactly like "all quiet".
