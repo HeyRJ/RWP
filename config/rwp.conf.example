@@ -18,6 +18,7 @@ RWP_REMOTE_DIR="Projects/RWP"                   # where this repo lives under ~ 
 
 # Thresholds
 PROJECTS_DIR="$HOME/Projects"                   # repos scanned for unpushed/uncommitted work (two levels deep)
+LOCAL_REPOS=""                                  # repos you keep local on purpose, space-separated: S5 reports them, never warns
 MIN_FREE_GB=50                                  # SSD free-space floor while away
 REQUIRED_VOLUMES=""                             # external volumes that must stay mounted, e.g. "Archive Data"
 STALE_DAYS=14                                   # tailnet node offline this long = stale

@@ -4,7 +4,7 @@ Good for: checking, reading a log, stopping a runaway spend, relaunching somethi
 
 ## What you have (after SETUP 3 and E2)
 
-- **Claude app** → the pinned conversation linked to the home Mac. Ask for `rwp status`, a log tail, a service relaunch. The AWAY rules still apply: nothing under A2 without your explicit go.
+- **Claude app** → the pinned conversation linked to the home Mac: one started from the home Mac's Claude app. It stays linked wherever you open it; a fresh chat on the phone is not linked and can only hand you the SSH line. Ask for `rwp status`, a log tail, a service relaunch. The AWAY rules still apply: nothing under A2 without your explicit go.
 - **ntfy** (optional, Tailscale on): the topic in `NTFY_TOPIC` for RWP pushes.
 - **SSH app** with its own key: `ssh <user>@<tailscale-name>`. Useful lines:
   - `~/Projects/RWP/bin/rwp status`

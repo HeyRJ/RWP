@@ -31,7 +31,7 @@ fi
 : "${SERVER_LABEL:=the home Mac}" "${LAPTOP_LABEL:=the laptop}" "${CONTROL_CHAT:=Home Mac control}"
 : "${RWP_REMOTE_DIR:=Projects/RWP}" "${AUTO_PUSH:=0}" "${HEARTBEAT_LABEL:=local.rwp.heartbeat}" "${HEARTBEAT_EVERY:=300}"
 : "${CARRY_NODES:=}" "${REQUIRED_VOLUMES:=}" "${SERVER_LAN_IP:=}" "${NTFY_URL:=}" "${NTFY_TOPIC:=rwp}"
-: "${PREBOOT_TESTED:=}" "${PROJECTS_DIR:=$HOME/Projects}"
+: "${PREBOOT_TESTED:=}" "${PROJECTS_DIR:=$HOME/Projects}" "${LOCAL_REPOS:=}"
 : "${MIN_FREE_GB:=50}" "${STALE_DAYS:=14}" "${ACTIVE_DAYS:=14}" "${JOB_MIN_SECS:=1800}" "${HANDOFF_MAX_HOURS:=24}"
 SERVER_UC="$(printf '%s' "$SERVER_LABEL" | awk '{print toupper(substr($0, 1, 1)) substr($0, 2)}')"   # for the start of a sentence
 STATE_DIR="$RWP_HOME/state"
@@ -397,8 +397,9 @@ chk_repos() {
       ahead="$(git -C "$r" rev-list --count '@{u}..HEAD' 2>/dev/null)"; up="${ahead} commit(s) not on the remote"
     fi
     last="$(git -C "$r" log -1 --format=%ct 2>/dev/null)"; age=$(( ( $(date +%s) - ${last:-0} ) / 86400 ))
+    case " $LOCAL_REPOS " in *" $name "*) url="";; esac   # repos you keep local by decision: never a warning
     if [ -z "$url" ]; then
-      info S5 "$name: local-only repo (no remote); $dirty uncommitted; from $LAPTOP_LABEL, work on it over SSH"
+      info S5 "$name: local-only repo; $dirty uncommitted; from $LAPTOP_LABEL, work on it over SSH"
     elif [ "$age" -le "$ACTIVE_DAYS" ] && { [ "${ahead:-0}" -gt 0 ] || [ "$dirty" -gt 0 ]; }; then
       warn S5 "$name: $up, $dirty uncommitted, last commit ${age} d ago: $LAPTOP_LABEL can't pull these" "commit + push if you'll need it away (you do this; RWP never touches another repo's git)"
     else
