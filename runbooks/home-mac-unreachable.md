@@ -10,7 +10,8 @@ Which restarts come back on their own (FileVault ON); the ways back in are in `r
 
 | Restart | Comes back to |
 |---|---|
-| macOS update | logged in, by itself |
+| macOS update you approved | logged in, by itself |
+| macOS update installed with nobody there | expect the unlock screen (automatic installs should be OFF) |
 | `rwp restart` (the way to restart it remotely; `fdesetup authrestart`) | the login window: log in by Screen Sharing (L1 fails until someone does) |
 | power out longer than the UPS lasts, a crash, a plain restart | the unlock screen → `rwp unlock` (section 2, step 4) |
 

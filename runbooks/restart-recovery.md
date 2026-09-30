@@ -9,7 +9,8 @@ Start on the laptop: `~/Projects/RWP/bin/rwp status`.
 
 | What happened | Where the Mac stops | Way back in | From where, out of the box | What's stopping "from anywhere" |
 |---|---|---|---|---|
-| macOS update | logged in, by itself | nothing to do | anywhere | nothing (D15) |
+| macOS update you approved at the keyboard | logged in, by itself (your password was stashed when you approved it) | nothing to do | anywhere | nothing |
+| macOS update installed with nobody there (automatic installs ON) | unknown: no password to stash, so expect the unlock screen | as row 3 | as row 3 | as row 3; turn automatic installs off (SETUP 1) |
 | `rwp restart` (planned; `fdesetup authrestart`) | **the login window**: nobody logged in, so the Tailscale app, your assistant's app and your LaunchAgents wait | Screen Sharing to the login window, log in | home Wi-Fi only | the Tailscale Mac apps don't run before login → `runbooks/tailscaled.md` or `runbooks/foothold.md` |
 | power out longer than the UPS lasts, a crash, a plain restart, a hard power-off | **the FileVault unlock screen** | `rwp unlock`: SSH at the unlock screen with your macOS password (macOS 26 or later, Apple silicon) | home Wi-Fi only | nothing on the tailnet reaches the house's network → `runbooks/foothold.md`; the LAN address must be fixed (SETUP 2) |
 | hung (no restart) | wherever it hung | a power cycle, then row 3 | someone at home, at the power button | no remote power switch (D below) |

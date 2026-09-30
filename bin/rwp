@@ -254,7 +254,7 @@ chk_updates() {
   au="$(defaults read /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates 2>/dev/null)"
   cr="$(defaults read /Library/Preferences/com.apple.SoftwareUpdate CriticalUpdateInstall 2>/dev/null)"
   if [ "$au" = 1 ]; then
-    warn H8 "automatic macOS updates ON: an update restart logs back in by itself (macOS stashes your login first), but it kills every job you started by hand" "System Settings > General > Software Update > Automatic Updates (i) > Install macOS updates OFF (or: sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates -bool false); update by hand when you're home"
+    warn H8 "automatic macOS updates ON: an update you approve at the keyboard logs back in by itself, but one installed while nobody is there has no password to stash and may stop at the unlock screen; either way it kills every job you started by hand" "System Settings > General > Software Update > Automatic Updates (i) > Install macOS updates OFF (or: sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates -bool false); update by hand when you're home"
   elif [ "$au" = 0 ]; then pass H8 "automatic macOS update install is OFF"
   else warn H8 "could not read the automatic-update setting" "check System Settings > General > Software Update"; fi
   if [ "$cr" = 1 ]; then info H8b "Security Responses & system files auto-install is ON (these can restart too; your call)"; fi

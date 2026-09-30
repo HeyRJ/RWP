@@ -10,12 +10,13 @@ What a restart does to a Mac with FileVault ON (ways back in: `runbooks/restart-
 
 | Restart | Comes back to |
 |---|---|
-| macOS update | **logged in, on its own**: macOS stashes your login before it reboots (seen on a Mac mini on macOS 27) |
+| macOS update **you approve at the keyboard** | **logged in, on its own**: the password you type at the install prompt is stashed and used after the reboot (seen on a Mac mini on macOS 27) |
+| macOS update installed **with nobody there** (automatic installs ON) | unknown, and nothing to stash a password from: expect the unlock screen, as row 3 |
 | `rwp restart` (runs `sudo fdesetup authrestart`) | **the login window**: FileVault skipped once, but nobody is logged in, so the Tailscale app, your assistant and your LaunchAgents wait ("goes straight to the regular login window", Der Flounder; E3a confirms). From outside: only with Tailscale before login or a foothold (W1) |
 | power out longer than the UPS lasts, a crash, a plain `shutdown -r` | **the FileVault unlock screen**: no Tailscale, no assistant. `rwp unlock` gets past it over SSH from home Wi-Fi (macOS 26+, Apple silicon); from outside only through a foothold (W2) |
 
 Every kind kills the jobs you started by hand; only launchd jobs come back (S22). `rwp status` lists what died (R1).
-- **Automatic installs off** (not a lockout, but they kill running work at a time you didn't choose): System Settings → General → Software Update → ⓘ next to Automatic Updates → **Install macOS updates: off**; for zero surprise restarts also **Install Security Responses and system files: off**. Keep "Download new updates" on. Terminal equivalent:
+- **Automatic installs off** (an unattended install may be a lockout, and it kills running work at a time you didn't choose): System Settings → General → Software Update → ⓘ next to Automatic Updates → **Install macOS updates: off**; for zero surprise restarts also **Install Security Responses and system files: off**. Keep "Download new updates" on. Terminal equivalent:
   ```
   sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate AutomaticallyInstallMacOSUpdates -bool false
   sudo defaults write /Library/Preferences/com.apple.SoftwareUpdate CriticalUpdateInstall -bool false   # optional

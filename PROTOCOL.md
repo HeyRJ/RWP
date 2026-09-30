@@ -27,7 +27,7 @@ Order matters. Everything that needs your hands happens first. Background jobs m
 | H5 | Claude desktop app running (the Claude link to the home Mac) | yes | `open -a Claude` |
 | H6 | SSD free space above the floor; required volumes mounted | yes | move finished outputs to an external drive |
 | H7 | Registered services up (`config/services.tsv`) | only `required=yes` | the restart hint in the registry (you run it) |
-| H8 | Automatic macOS updates OFF (an update restart logs back in by itself, but kills every job started by hand) | no | Software Update → Automatic Updates → Install macOS updates OFF |
+| H8 | Automatic macOS updates OFF (an update you approve logs back in by itself; one installed with nobody there may stop at the unlock screen; both kill every job started by hand) | no | Software Update → Automatic Updates → Install macOS updates OFF |
 | H9 | Handoff receipt: from the laptop, off the home network, < 24 h old | yes, at activation | on the laptop, on a phone hotspot: `bin/rwp handoff` |
 | W1 | After `rwp restart` (stops at the login window): a way to log in from outside, i.e. Tailscale before login or a foothold | no, but see §4 | `runbooks/tailscaled.md` or `runbooks/foothold.md` |
 | W2 | After a power cut beyond the UPS, a crash or a plain restart (the unlock screen): a way to reach it from outside, i.e. a foothold routing to the Mac's LAN address | no, but see §4 | `runbooks/foothold.md` |

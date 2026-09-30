@@ -8,7 +8,7 @@ It's a handful of markdown files and one read-only bash script, made to be run w
 
 Remote access that works on your home Wi-Fi tells you nothing about the hotel. What strands people is boring and predictable:
 
-- **A restart while you're away.** With FileVault on, a power cut longer than your UPS lasts, a crash or a plain restart leaves the Mac at the unlock screen, and even a careful remote restart (`fdesetup authrestart`) stops at the login window: either way the Tailscale app isn't running, so from outside the house nothing reaches it. (A macOS update restart logs back in by itself, but kills everything you started by hand.) RWP has a command for each way back in and tells you which ones work from where you'll be.
+- **A restart while you're away.** With FileVault on, a power cut longer than your UPS lasts, a crash or a plain restart leaves the Mac at the unlock screen, and even a careful remote restart (`fdesetup authrestart`) stops at the login window: either way the Tailscale app isn't running, so from outside the house nothing reaches it. (An update you approve at the keyboard logs back in by itself; one installed with nobody there may not. Both kill everything you started by hand.) RWP has a command for each way back in and tells you which ones work from where you'll be.
 - **Testing from home.** On your own network the local path hides a broken remote path. It works right up until you leave.
 - **One way in.** Only the laptop's SSH key can log in. Lose the laptop and you're locked out of your own machine.
 - **Silence.** Your alerts come from the machine that just died, so a dead Mac looks exactly like "all quiet".
