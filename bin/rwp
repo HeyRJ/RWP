@@ -658,7 +658,7 @@ cmd_depart() {
 cmd_handoff() {
   if [ "$(role)" = server ]; then echo "rwp handoff runs on $LAPTOP_LABEL: it tests the path TO $SERVER_LABEL." >&2; exit 2; fi
   OUT="$STATE_DIR/handoff_$STAMP.txt"; : > "$OUT"
-  local me lan=unknown route="?" sshok=no vncok=no fv=unknown ke pong ok
+  local me lan=unknown route="?" sshok=no vncok=no fv=unknown ke pong ok myip=""
   me="$(scutil --get LocalHostName 2>/dev/null)"
   say "RWP handoff: $me -> $SERVER_TS_NAME - $NOW"
   if [ -z "$TS_BIN" ] || ! "$TS_BIN" status >/dev/null 2>&1; then
@@ -672,10 +672,14 @@ cmd_handoff() {
       fail HO2 "no Tailscale pong from $SERVER_TS_NAME" "is $SERVER_LABEL online? Tailscale admin console > Machines"
     else
       route="$(printf '%s' "$pong" | sed -E 's/.* via ([^ ]+) in .*/\1/')"
+      # a direct path over a public IPv6 address looks "remote" even from the sofa: also compare this Mac's own IPv4 with the home subnet
+      myip="$(ipconfig getifaddr "$(/sbin/route -n get default 2>/dev/null | awk '/interface:/{print $2}')" 2>/dev/null)"
       case "$route" in
         192.168.*|10.*|172.1[6-9].*|172.2[0-9].*|172.3[01].*)
           lan=yes; warn HO2 "reached $SERVER_LABEL via $route: you are on the home network, which proves nothing about remote access" "rerun on a phone hotspot";;
-        *) lan=no; pass HO2 "reached $SERVER_LABEL via $route (off the home network)";;
+        *) if [ -n "$SERVER_LAN_IP" ] && [ -n "$myip" ] && [ "${myip%.*}" = "${SERVER_LAN_IP%.*}" ]; then
+             lan=yes; warn HO2 "reached $SERVER_LABEL via $route, but this Mac's address $myip is on the home subnet: proves nothing about remote access" "rerun on a phone hotspot (home Wi-Fi off)"
+           else lan=no; pass HO2 "reached $SERVER_LABEL via $route (off the home network; this Mac is $myip)"; fi;;
       esac
     fi
   fi
